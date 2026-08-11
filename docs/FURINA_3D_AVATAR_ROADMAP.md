@@ -160,23 +160,23 @@ Placeholder / VRM(Three.js) / Unity / Future Engine
 - 输出：可用的占位渲染
 - 验收：心情/口型在占位上可见
 
-### Phase 3：VRM Avatar 接入（依赖素材）
+### Phase 3：VRM Avatar 接入（已完成）
 
 - 目标：Three.js + `@pixiv/three-vrm` 加载 `Furina.vrm`
 - 输入：VRM 模型（资产规范达标）+ 性能预算
 - 输出：Avatar 舞台显示 3D 形象
-- 验收：加载 <2s、60fps、Placeholder 可回退
+- 验收：本地 VRM 可加载，资产缺失时可回退 Placeholder；性能预算继续实测优化
 
-### Phase 4：语音口型（LipSync）
+### Phase 4：语音口型（部分完成）
 
-- 目标：`audio_level` → 口型跟随
+- 当前：已按 speaking 状态驱动基础口型；目标升级为 `audio_level` → 口型跟随
 - 输入：TTS 音频电平 + VRM BlendShape
 - 输出：说话时口型自然开合
 - 验收：口型与音频同步无明显延迟
 
-### Phase 5：表情与动作系统
+### Phase 5：表情与动作系统（部分完成）
 
-- 目标：`emotion → Expression`、`intent → Motion`
+- 当前：Expression 权重映射已接入；目标继续完成 `emotion → Expression`、`intent → Motion`
 - 输入：avatar_expression / avatar_intent
 - 输出：心情表情切换、意图动作触发
 - 验收：6 表情 × 4 动作可触发且与协议一致

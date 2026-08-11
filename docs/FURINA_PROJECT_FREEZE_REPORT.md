@@ -1,6 +1,6 @@
-# Furina Agent 项目冻结报告
+# Furina Desktop 架构冻结报告
 
-> 冻结日期：2026-08-07 · 基线：`main @ ba82316`
+> 初始冻结日期：2026-08-07 · Desktop 独立基线：`desktop-v0.1.1`
 > 范围：冻结**协议与架构边界**，不冻结业务迭代。
 > 关联文档：[FURINA_DESKTOP_UI_SPEC_V1.md](FURINA_DESKTOP_UI_SPEC_V1.md)、
 > [FURINA_3D_AVATAR_ROADMAP.md](FURINA_3D_AVATAR_ROADMAP.md)、
@@ -12,8 +12,8 @@
 
 | 项 | 状态 |
 | --- | --- |
-| Git 基线 | `main @ ba82316` |
-| Rust 测试 | 193 项全绿；Python 27 项全绿 |
+| Git 基线 | `desktop-v0.1.1` |
+| 自动测试 | Rust 147 项通过；Python 27 项通过；Vite 生产构建通过 |
 | 桌面版 | v2（React + Vite）已交付：Avatar 舞台 / 对话工作区 / 灵魂面板 / 运行状态条 |
 | 语音 | TTS（fish 免费模型 + 公开音色包）+ ASR（qwen 免费额度） |
 | 人格化插话 | LLM 关键节点插话（含表达策略层） |
@@ -25,7 +25,7 @@
 - **Persona 系统**：furina.yaml 模板 + `commands:` 台词数据源 + LLM 插话 + 表达策略（theatrical / casual / gentle / serious）。
 - **Memory / Relationship**：持久化到 `.furina/memory/`（gitignore），重启不丢；关系为状态非文案。
 - **Agent Core**：状态机、权限网关（白名单/危险模式/越界/私有目录拒绝）、上下文压缩、验证闭环、多模型网关。
-- **CLI / TUI**：折叠输出、`/展开`、记忆/关系面板、语音控制、联网搜索。
+- **Desktop 交互**：流式对话、记忆/关系面板、语音控制、审批弹窗和联网能力。
 - **Desktop v2**：React 前端、soul_state 完整协议、`get_memories`、插话气泡、审批弹窗。
 - **联网搜索 / 语音 / 插话**：Web Intelligence、TTS+ASR、LLM 插话均可用。
 
@@ -51,9 +51,9 @@
 | Soul Layer | **Stable** |
 | Agent Layer | **Stable** |
 | Avatar Protocol | **Frozen** |
-| Avatar Provider | **Frozen Interface**（实现未定） |
-| Avatar Model | **Asset Preparation Phase**（素材准备中） |
-| Rendering Implementation | **Not Started**（占位剪影为现状） |
+| Avatar Provider | **Frozen Interface**（当前实现：Three.js + VRM） |
+| Avatar Model | **Integrated**（本地 VRM 资产，Git 忽略） |
+| Rendering Implementation | **Implemented**（Three.js + `@pixiv/three-vrm`） |
 
 > 冻结的是**协议与边界**，不是 AI 能力开发。以下业务仍可继续迭代：
 > Memory 增强、Voice 优化、Tool 扩展、Agent 能力提升、UI/插话/表达策略演进。
@@ -71,8 +71,8 @@
 | # | 债务 | 说明 |
 | --- | --- | --- |
 | 1 | 桌面端无 persona 模板层 | 工具中间态用中性状态行（设计取舍，非缺陷） |
-| 2 | 跨端渲染统一度 | CLI/TUI/Desktop 渲染实现不同，数据源已统一（`commands:`） |
-| 3 | 3D 素材缺失 | 无 VRM 模型/立绘，渲染实现未启动 |
+| 2 | 历史跨端描述 | 部分旧文档仍记录 CLI/TUI 阶段，仅作为历史背景保留 |
+| 3 | VRM 性能调优 | 当前已接入 VRM，仍需继续优化 bundle、动作和口型性能 |
 | 4 | 性能预算未实测 | 路线图给出第一版建议值，待 VRM 接入后校准 |
 
 ## 7. 后续开发边界

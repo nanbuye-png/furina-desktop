@@ -6,10 +6,10 @@
 
 | 版本 | 主题 | 内容 |
 | --- | --- | --- |
-| V1（已完成） | 人格 Prompt + 静态情绪 | 心情系统、惰性扫描、折叠 CLI、人格丰满化、灵魂架构冻结 |
+| V1（已完成） | 人格 Prompt + 静态情绪 | 心情系统、惰性扫描、人格丰满化、灵魂架构冻结 |
 | V1.1（已完成） | 人格运行系统第一版 | furina-soul：六维情绪、关系阶段、三类记忆+评分、价值观/行为意图、动态注入 |
 | V2（已完成） | 人格运行系统完整版 | Soul 入 core 管道、关系可解释、记忆 LLM 抽取、主动性 Engine、测试报告解析 |
-| V3（部分完成） | 表现层 | TUI（滚动/展开/复制导出）✅、语音（TTS + qwen ASR + 情绪语音）✅、桌面版 v1 GUI ✅；3D Avatar 桌面形象待做（路线见 FURINA_3D_AVATAR_ROADMAP.md） |
+| V3（进行中） | Desktop 表现层 | React/Tauri UI ✅、TTS + Qwen ASR ✅、VRM Avatar ✅；口型、动作和安装发布流程待完善 |
 | V4（规划） | 生态层 | 多模型路由、3D Avatar、Multi-Agent（共享记忆、独立人格实例） |
 
 ## 灵魂能力演进
@@ -36,7 +36,7 @@
 - V3+：语音主动开口、Avatar 表情事件
 
 ### 注入管道
-- V1.1：CLI 拼串注入 ✅
+- V1.1：通过 `PromptContextProvider` 注入 Agent Core ✅
 - V2：core `PromptContextProvider` 管道（run/chat/GUI 统一）
 - V3+：按终端能力裁剪注入块（文本/语音/视觉）
 

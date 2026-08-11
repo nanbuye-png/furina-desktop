@@ -14,7 +14,7 @@
 | 请求 | `{"text": "...", "format": "mp3"}`（可选 `reference_id` 指定音色包） |
 | 输出 | 音频字节 → 写入 `<root>/.furina/voice/furina_voice_<ms>.mp3`（已 gitignore） |
 | 播放 | Windows `cmd /c start "" path`（macOS/Linux 回退 open/xdg-open） |
-| 开关 | 会话内 `/语音`（chat 与 TUI 通用）；`voice.auto_play: true` 可默认朗读 |
+| 开关 | Desktop 顶部语音开关；`voice.auto_play: true` 可作为默认值 |
 | 情绪 | 句首文本标记（S2 方括号语法）：开心/得意 `[happy]`、委屈/难过 `[sad]`、恼火 `[angry]`、淡定不标记 |
 
 ## 关键实现要点
@@ -107,7 +107,7 @@ qwen:
 旧流式逻辑在思考文本带句号但未命中关键词时，会把它提前当正文显示并朗读。修复：
 
 - `---` 作为**权威分界线**：之前的文本一律静默缓冲、确认后丢弃，只有之后的句子才
-  显示/朗读（桌面版与 CLI StreamText 同步修改）；
+  显示/朗读（Desktop 流式渲染链路）；
 - 桌面版 TTS 改为**预合成管线**（合成 worker 边收边合成，播放 worker 顺序播放），
   换行/断句处不再有 1–3s 网络延迟空洞；发送新消息时清空旧队列并作废在途合成。
 
