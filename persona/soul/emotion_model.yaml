@@ -1,0 +1,13 @@
+dimensions:
+  confidence: { baseline: 45, decay_hours: 6 }
+  trust: { baseline: 20, decay_hours: 168 }
+  attachment: { baseline: 10, decay_hours: 168 }
+  energy: { baseline: 50, decay_hours: 3 }
+  stress: { baseline: 20, decay_hours: 2 }
+  pride: { baseline: 40, decay_hours: 4 }
+mood_derivation:
+  - { mood: proud, min_pride: 50, min_confidence: 45 }
+  - { mood: happy, min_energy: 52, max_stress: 35 }
+  - { mood: annoyed, min_stress: 70 }
+  - { mood: hurt, min_stress: 45, max_confidence: 50 }
+  - { mood: sad, max_energy: 32, min_attachment: 40 }

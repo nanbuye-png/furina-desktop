@@ -1,0 +1,734 @@
+//! 语音合成（TTS）：fish.audio 或 Qwen-Omni（DashScope，免费固定音色）→ 音频。
+//!
+//! 人格情绪只通过句首情绪标记（如 `[happy]`）影响语气，不改变任何技术事实；
+//! 合成请求外发到对应 API，生成文件只落在 `.furina/voice/`（已 gitignore）。
+//!
+//! provider 选择（config.yaml `voice.provider`）：
+//! - `fish`（默认）：fish.audio `/v1/tts`。免费模型 `s2.1-pro-free` 不传 reference_id
+//!   时每次随机音色；自购音色包传 reference_id 后音色固定但按量计费（无额度返回 402）。
+//! - `qwen`：DashScope qwen3.5-omni-flash（免费额度），`audio.voice` 指定固定音色，
+//!   必须 `stream: true`，SSE 里取 `delta.audio.data`（base64 → wav）。
+
+use crate::config::Config;
+use crate::proxy::apply_system_proxy;
+use base64::Engine as _;
+use serde_json::json;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// TTS 客户端：按 `voice.provider` 选择后端。
+#[derive(Clone, Debug)]
+pub struct VoiceClient {
+    client: reqwest::Client,
+    kind: VoiceKind,
+    /// 输出格式：fish 为 mp3/wav/flac；qwen 固定 wav。
+    format: String,
+    max_text_len: usize,
+    output_dir: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+enum VoiceKind {
+    Fish {
+        api_key: String,
+        endpoint: String,
+        model: String,
+        reference_id: String,
+    },
+    Qwen {
+        api_key: String,
+        base_url: String,
+        model: String,
+        voice: String,
+    },
+}
+
+impl VoiceClient {
+    /// 从配置解析语音客户端；未启用或缺 key 时返回错误。
+    pub fn from_config(cfg: &Config, output_dir: &Path) -> anyhow::Result<Self> {
+        if !cfg.voice.enabled {
+            anyhow::bail!("语音合成未启用（config.yaml 中 voice.enabled: true 后可启用）");
+        }
+        let provider = cfg.voice.provider.trim().to_lowercase();
+        let client = apply_system_proxy(
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .timeout(Duration::from_secs(120)),
+        )
+        .build()?;
+        let (kind, format) = match provider.as_str() {
+            "fish" => {
+                let api_key = env_key(&cfg.voice.api_key_env, "FISH_AUDIO_API_KEY")?;
+                // 音色 ID 解析顺序：环境变量 FURINA_VOICE_REFERENCE_ID（推荐放 secrets.env，不上传）
+                // → config.yaml 的 voice.reference_id。留空时 fish 免费模型使用随机默认音色。
+                let reference_id = std::env::var("FURINA_VOICE_REFERENCE_ID")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| cfg.voice.reference_id.trim().to_string());
+                let model = {
+                    let m = cfg.voice.model.trim().to_string();
+                    if m.is_empty() { "s2.1-pro-free".into() } else { m }
+                };
+                let format = {
+                    let f = cfg.voice.format.trim().to_lowercase();
+                    if f.is_empty() { "mp3".into() } else { f }
+                };
+                (
+                    VoiceKind::Fish {
+                        api_key,
+                        endpoint: cfg.voice.endpoint.trim_end_matches('/').to_string(),
+                        model,
+                        reference_id,
+                    },
+                    format,
+                )
+            }
+            "qwen" => {
+                let api_key = env_key(&cfg.qwen.api_key_env, "QWEN_API_KEY")?;
+                let model = {
+                    let m = cfg.qwen.tts_model.trim().to_string();
+                    if m.is_empty() { "qwen3.5-omni-flash".into() } else { m }
+                };
+                let voice = {
+                    let v = cfg.qwen.tts_voice.trim().to_string();
+                    if v.is_empty() { "Tina".into() } else { v }
+                };
+                (
+                    VoiceKind::Qwen {
+                        api_key,
+                        base_url: cfg.qwen.base_url.trim_end_matches('/').to_string(),
+                        model,
+                        voice,
+                    },
+                    "wav".into(),
+                )
+            }
+            other => anyhow::bail!("未知 TTS provider: {other}（支持 fish / qwen）"),
+        };
+        Ok(Self {
+            client,
+            kind,
+            format,
+            max_text_len: cfg.voice.max_text_len.max(10),
+            output_dir: output_dir.to_path_buf(),
+        })
+    }
+
+    pub fn provider(&self) -> &str {
+        match self.kind {
+            VoiceKind::Fish { .. } => "fish",
+            VoiceKind::Qwen { .. } => "qwen",
+        }
+    }
+
+    /// 输出格式（mp3 / wav），用于文件名与前端播放类型。
+    pub fn format(&self) -> &str {
+        &self.format
+    }
+
+    /// 声音模型 ID（fish reference_id 或 qwen 音色名，用于展示）。
+    pub fn reference_id(&self) -> &str {
+        match &self.kind {
+            VoiceKind::Fish { reference_id, .. } => reference_id,
+            VoiceKind::Qwen { voice, .. } => voice,
+        }
+    }
+
+    pub fn model(&self) -> &str {
+        match &self.kind {
+            VoiceKind::Fish { model, .. } => model,
+            VoiceKind::Qwen { model, .. } => model,
+        }
+    }
+
+    pub fn output_dir(&self) -> &Path {
+        &self.output_dir
+    }
+
+    /// 规范化情绪标记（S2 模型方括号语法）：`happy` → `[happy]`，`[sad]` → `[sad]`。
+    /// 兼容旧的圆括号写法（自动转方括号）；空串保持空。
+    pub fn emotion_tag(emotion: &str) -> String {
+        let t = emotion.trim();
+        if t.is_empty() {
+            return String::new();
+        }
+        let t = t
+            .trim_start_matches(['[', '('])
+            .trim_end_matches([']', ')']);
+        if t.is_empty() {
+            return String::new();
+        }
+        format!("[{t}]")
+    }
+
+    /// 合成语音并写入输出目录，返回音频文件路径。
+    /// `speed`：朗读语速（0.5–2.0，1.0 为正常）。
+    pub async fn synthesize(&self, text: &str, emotion: &str, speed: f64) -> anyhow::Result<PathBuf> {
+        let bytes = self.request_audio(text, emotion, speed).await?;
+        std::fs::create_dir_all(&self.output_dir)?;
+        let ext = match self.format.as_str() {
+            "wav" => "wav",
+            "flac" => "flac",
+            _ => "mp3",
+        };
+        let path = self
+            .output_dir
+            .join(format!("furina_voice_{}.{ext}", unix_ms()));
+        std::fs::write(&path, &bytes)?;
+        Ok(path)
+    }
+
+    /// 合成语音并返回音频字节（不落盘，供桌面版前端直接播放）。
+    pub async fn synthesize_bytes(
+        &self,
+        text: &str,
+        emotion: &str,
+        speed: f64,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.request_audio(text, emotion, speed).await
+    }
+
+    /// 共享请求逻辑：文本清理 → 情绪标记 → 按 provider 请求 → 音频字节。
+    async fn request_audio(&self, text: &str, emotion: &str, speed: f64) -> anyhow::Result<Vec<u8>> {
+        let cleaned = clean_for_tts(text, self.max_text_len);
+        if cleaned.is_empty() {
+            anyhow::bail!("没有可合成的文本");
+        }
+        match &self.kind {
+            VoiceKind::Fish { api_key, endpoint, model, reference_id } => {
+                // fish S2 系列支持方括号情绪标记（如 [happy]）；qwen omni 不支持，
+                // 加了会被当成正文朗读出来。
+                let tag = Self::emotion_tag(emotion);
+                let payload = if tag.is_empty() {
+                    cleaned
+                } else {
+                    format!("{tag}{cleaned}")
+                };
+                self.request_fish(&payload, speed, api_key, endpoint, model, reference_id)
+                    .await
+            }
+            VoiceKind::Qwen { api_key, base_url, model, voice } => {
+                self.request_qwen(&cleaned, api_key, base_url, model, voice).await
+            }
+        }
+    }
+
+    /// fish.audio `/v1/tts`：JSON 请求，直接返回音频字节。
+    async fn request_fish(
+        &self,
+        payload: &str,
+        speed: f64,
+        api_key: &str,
+        endpoint: &str,
+        model: &str,
+        reference_id: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        let body = json!({
+            "text": payload,
+            "format": self.format,
+            "prosody": {"speed": speed.clamp(0.5, 2.0)},
+        });
+        let mut body = body;
+        if !reference_id.is_empty() {
+            body["reference_id"] = json!(reference_id);
+        }
+        let resp = self
+            .client
+            .post(endpoint)
+            .bearer_auth(api_key)
+            .header("model", model)
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            if status.as_u16() == 402 {
+                anyhow::bail!(
+                    "fish.audio 额度不足（402）：音色包 reference_id 按量计费，需充值后可用；\
+                     也可在 config.yaml 把 voice.provider 改为 qwen 使用免费固定音色"
+                );
+            }
+            anyhow::bail!("语音 API 错误 {status}: {}", short(&text));
+        }
+        let bytes = resp.bytes().await?;
+        if bytes.is_empty() {
+            anyhow::bail!("语音 API 返回空音频");
+        }
+        Ok(bytes.to_vec())
+    }
+
+    /// Qwen-Omni TTS：SSE 流式，`delta.audio.data` 为 base64 音频分段。
+    async fn request_qwen(
+        &self,
+        payload: &str,
+        api_key: &str,
+        base_url: &str,
+        model: &str,
+        voice: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        let body = json!({
+            "model": model,
+            "messages": [{
+                "role": "user",
+                "content": [{ "type": "text", "text": payload }],
+            }],
+            "modalities": ["text", "audio"],
+            "audio": { "voice": voice, "format": "wav" },
+            "stream": true,
+        });
+        let resp = self
+            .client
+            .post(format!("{base_url}/chat/completions"))
+            .bearer_auth(api_key)
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("Qwen 语音合成错误 {status}: {}", short(&text));
+        }
+        let mut b64 = String::new();
+        for line in text.lines() {
+            let line = line.trim();
+            let Some(data) = line.strip_prefix("data:") else { continue };
+            let data = data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(data)
+                .map_err(|e| anyhow::anyhow!("Qwen 语音流数据无效: {e}"))?;
+            if let Some(err) = v.get("error") {
+                anyhow::bail!("Qwen 语音合成流错误: {err}");
+            }
+            if let Some(part) = v["choices"][0]["delta"]["audio"]["data"].as_str() {
+                b64.push_str(part);
+            }
+        }
+        if b64.is_empty() {
+            anyhow::bail!("Qwen 语音合成未返回音频数据");
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| anyhow::anyhow!("Qwen 音频 base64 解码失败: {e}"))?;
+        if bytes.is_empty() {
+            anyhow::bail!("Qwen 语音合成返回空音频");
+        }
+        // DashScope omni 的 `format: wav/mp3` 实际都返回 24kHz 16-bit 单声道裸 PCM，
+        // 这里统一包上 RIFF/WAVE 头，保证前端可直接播放。
+        Ok(pcm_to_wav(&bytes, 24000))
+    }
+}
+
+/// 把 16-bit 单声道裸 PCM 包装成标准 WAV（RIFF/WAVE）字节。
+fn pcm_to_wav(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
+    let data_len = pcm.len() as u32;
+    let mut out = Vec::with_capacity(44 + pcm.len());
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len).to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&1u16.to_le_bytes()); // mono
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // byte rate
+    out.extend_from_slice(&2u16.to_le_bytes()); // block align
+    out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    out.extend_from_slice(pcm);
+    out
+}
+
+fn env_key(var: &str, fallback: &str) -> anyhow::Result<String> {
+    let name = {
+        let v = var.trim();
+        if v.is_empty() { fallback } else { v }
+    };
+    let key = std::env::var(name).map_err(|_| {
+        anyhow::anyhow!("缺少环境变量 {name}（请在 .furina/secrets.env 添加 {name}=xxx）")
+    })?;
+    if key.trim().is_empty() {
+        anyhow::bail!("语音 API key 为空（{name}）");
+    }
+    Ok(key)
+}
+
+/// 把回复文本整理成适合朗读的形式：跳过代码块、去掉 markdown 行首符号、
+/// 合并多余空行、按配置上限截断。
+fn clean_for_tts(text: &str, max_len: usize) -> String {
+    let mut out = String::new();
+    let mut in_fence = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || line.is_empty() {
+            continue;
+        }
+        let line = line
+            .trim_start_matches(['#', '*', '-', '>', '|'])
+            .trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    let out: String = out.chars().take(max_len).collect();
+    out.trim().to_string()
+}
+
+fn short(text: &str) -> String {
+    let t: String = text.chars().take(300).collect();
+    if text.chars().count() > 300 {
+        format!("{t}…")
+    } else {
+        t
+    }
+}
+
+fn unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn spawn_http_mock(
+        status: u16,
+        body: Vec<u8>,
+        captured: std::sync::Arc<std::sync::Mutex<String>>,
+    ) -> String {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                tx.send(addr.to_string()).unwrap();
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 64 * 1024];
+                let n = sock.read(&mut buf).await.unwrap();
+                if let Ok(s) = std::str::from_utf8(&buf[..n]) {
+                    *captured.lock().unwrap() = s.to_string();
+                }
+                let reason = if status == 200 { "OK" } else { "Error" };
+                let resp = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+            });
+        });
+        rx.recv().unwrap()
+    }
+
+    fn fish_config(base_url: String, key_env: &str) -> Config {
+        let mut cfg = Config::default();
+        cfg.voice.enabled = true;
+        cfg.voice.provider = "fish".into();
+        cfg.voice.endpoint = format!("{base_url}/v1/tts");
+        cfg.voice.reference_id = "voice-model-001".into();
+        cfg.voice.api_key_env = key_env.into();
+        cfg
+    }
+
+    fn qwen_config(base_url: String, key_env: &str) -> Config {
+        let mut cfg = Config::default();
+        cfg.voice.enabled = true;
+        cfg.voice.provider = "qwen".into();
+        cfg.qwen.base_url = base_url;
+        cfg.qwen.api_key_env = key_env.into();
+        cfg.qwen.tts_model = "qwen3.5-omni-flash".into();
+        cfg.qwen.tts_voice = "Tina".into();
+        cfg
+    }
+
+    #[test]
+    fn emotion_tag_normalizes() {
+        assert_eq!(VoiceClient::emotion_tag(""), "");
+        assert_eq!(VoiceClient::emotion_tag("  "), "");
+        assert_eq!(VoiceClient::emotion_tag("happy"), "[happy]");
+        assert_eq!(VoiceClient::emotion_tag("[sad]"), "[sad]");
+        assert_eq!(VoiceClient::emotion_tag(" (angry) "), "[angry]");
+        assert_eq!(VoiceClient::emotion_tag("()"), "");
+        assert_eq!(VoiceClient::emotion_tag("[]"), "");
+    }
+
+    #[test]
+    fn from_config_gates() {
+        let mut cfg = Config::default();
+        let dir = std::env::temp_dir();
+        cfg.voice.api_key_env = "FURINA_TEST_VOICE_KEY_ABSENT".into();
+        assert!(VoiceClient::from_config(&cfg, &dir).is_err(), "未启用应报错");
+        cfg.voice.enabled = true;
+        assert!(VoiceClient::from_config(&cfg, &dir).is_err(), "缺 key 应报错");
+        unsafe {
+            std::env::set_var("FURINA_TEST_VOICE_KEY_ABSENT", "k");
+        }
+        let client = VoiceClient::from_config(&cfg, &dir).unwrap();
+        assert_eq!(client.model(), "s2.1-pro-free");
+        assert_eq!(client.provider(), "fish");
+        unsafe {
+            std::env::remove_var("FURINA_TEST_VOICE_KEY_ABSENT");
+        }
+    }
+
+    #[test]
+    fn qwen_provider_resolves_config() {
+        let mut cfg = Config::default();
+        cfg.voice.enabled = true;
+        cfg.voice.provider = "qwen".into();
+        cfg.qwen.api_key_env = "FURINA_TEST_QWEN_VOICE_KEY".into();
+        cfg.qwen.tts_voice = "Seraphina".into();
+        unsafe {
+            std::env::set_var("FURINA_TEST_QWEN_VOICE_KEY", "qk");
+        }
+        let client = VoiceClient::from_config(&cfg, &std::env::temp_dir()).unwrap();
+        assert_eq!(client.provider(), "qwen");
+        assert_eq!(client.model(), "qwen3.5-omni-flash");
+        assert_eq!(client.reference_id(), "Seraphina");
+        assert_eq!(client.format(), "wav");
+        unsafe {
+            std::env::remove_var("FURINA_TEST_QWEN_VOICE_KEY");
+        }
+    }
+
+    #[test]
+    fn unknown_provider_rejected() {
+        let mut cfg = Config::default();
+        cfg.voice.enabled = true;
+        cfg.voice.provider = "nope".into();
+        unsafe {
+            std::env::set_var("FISH_AUDIO_API_KEY", "k");
+        }
+        let err = VoiceClient::from_config(&cfg, &std::env::temp_dir())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("未知 TTS provider"), "{err}");
+        unsafe {
+            std::env::remove_var("FISH_AUDIO_API_KEY");
+        }
+    }
+
+    #[test]
+    fn clean_for_tts_skips_code_fences_and_markdown() {
+        let text = "哼，易如反掌。\n\n```rust\nlet x = 1;\n```\n\n- 第一点\n- 第二点";
+        let cleaned = clean_for_tts(text, 1000);
+        assert!(!cleaned.contains("```"));
+        assert!(!cleaned.contains("let x"));
+        assert!(cleaned.contains("哼，易如反掌"));
+        assert!(cleaned.contains("第一点"));
+        assert!(cleaned.contains("第二点"));
+    }
+
+    #[test]
+    fn clean_for_tts_truncates() {
+        let text = "abcdefghij";
+        assert_eq!(clean_for_tts(text, 5), "abcde");
+        assert_eq!(clean_for_tts("", 5), "");
+    }
+
+    #[tokio::test]
+    async fn synthesize_writes_audio_file() {
+        let body = b"ID3 mock audio bytes".to_vec();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let addr = spawn_http_mock(200, body.clone(), captured.clone());
+        let cfg = fish_config(format!("http://{addr}"), "FURINA_TEST_VOICE_KEY");
+        unsafe {
+            std::env::set_var("FURINA_TEST_VOICE_KEY", "test-key");
+        }
+        let dir = std::env::temp_dir().join(format!("furina_voice_test_{}", unix_ms()));
+        let client = VoiceClient::from_config(&cfg, &dir).unwrap();
+        let path = client.synthesize("你好呀", "happy", 1.1).await.unwrap();
+        assert!(path.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        assert!(path.extension().unwrap() == "mp3");
+        let req = captured.lock().unwrap().clone();
+        assert!(req.contains("reference_id"));
+        assert!(req.contains("voice-model-001"));
+        assert!(req.contains("[happy]"));
+        assert!(req.contains("prosody") && req.contains("1.1"), "应带语速参数: {req}");
+        assert!(req.to_lowercase().contains("model: s2.1-pro-free"), "model 应作为请求头");
+        assert!(req.to_lowercase().contains("bearer test-key"), "应带 Bearer 鉴权");
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("FURINA_TEST_VOICE_KEY");
+        }
+    }
+
+    #[tokio::test]
+    async fn synthesize_bytes_returns_audio_without_file() {
+        let body = b"ID3 bytes only".to_vec();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let addr = spawn_http_mock(200, body.clone(), captured.clone());
+        let cfg = fish_config(format!("http://{addr}"), "FURINA_TEST_VOICE_KEY");
+        unsafe {
+            std::env::set_var("FURINA_TEST_VOICE_KEY", "test-key");
+        }
+        let dir = std::env::temp_dir().join(format!("furina_voice_bytes_{}", unix_ms()));
+        let client = VoiceClient::from_config(&cfg, &dir).unwrap();
+        let bytes = client.synthesize_bytes("你好", "", 1.0).await.unwrap();
+        assert_eq!(bytes, body, "synthesize_bytes 应返回音频字节");
+        assert!(!dir.exists(), "不落盘：输出目录不应被创建");
+        unsafe {
+            std::env::remove_var("FURINA_TEST_VOICE_KEY");
+        }
+    }
+
+    #[tokio::test]
+    async fn synthesize_surfaces_api_error() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let addr = spawn_http_mock(402, b"{\"error\":\"Insufficient API credit\"}".to_vec(), captured);
+        let cfg = fish_config(format!("http://{addr}"), "FURINA_TEST_VOICE_KEY");
+        unsafe {
+            std::env::set_var("FURINA_TEST_VOICE_KEY", "test-key");
+        }
+        let dir = std::env::temp_dir().join(format!("furina_voice_err_{}", unix_ms()));
+        let client = VoiceClient::from_config(&cfg, &dir).unwrap();
+        let err = client.synthesize("测试", "", 1.0).await.unwrap_err().to_string();
+        assert!(err.contains("402"), "{err}");
+        unsafe {
+            std::env::remove_var("FURINA_TEST_VOICE_KEY");
+        }
+    }
+
+    #[tokio::test]
+    async fn qwen_synthesize_parses_sse_audio() {
+        // 两个 SSE 分片，各含一段 base64；拼接后应还原原始音频字节。
+        let half1 = base64::engine::general_purpose::STANDARD.encode(b"RIFF....WAVE");
+        let half2 = base64::engine::general_purpose::STANDARD.encode(b"data-bytes");
+        let sse = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"audio\":{{\"data\":\"{half1}\"}}}}}}]}}\n\n\
+             data: {{\"choices\":[{{\"delta\":{{\"audio\":{{\"data\":\"{half2}\"}}}}}}]}}\n\n\
+             data: [DONE]\n\n"
+        );
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let addr = spawn_http_mock(200, sse.into_bytes(), captured.clone());
+        let cfg = qwen_config(format!("http://{addr}"), "FURINA_TEST_QWEN_VOICE_KEY");
+        unsafe {
+            std::env::set_var("FURINA_TEST_QWEN_VOICE_KEY", "qwen-key");
+        }
+        let dir = std::env::temp_dir().join(format!("furina_qwen_voice_{}", unix_ms()));
+        let client = VoiceClient::from_config(&cfg, &dir).unwrap();
+        let bytes = client.synthesize_bytes("你好呀", "", 1.0).await.unwrap();
+        assert_eq!(&bytes[..4], b"RIFF", "应包装成 wav");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        assert_eq!(&bytes[44..], b"RIFF....WAVEdata-bytes", "原始音频应跟在 44 字节头之后");
+        let req = captured.lock().unwrap().clone();
+        assert!(req.contains("qwen3.5-omni-flash"), "应带模型名");
+        assert!(req.contains("\"voice\":\"Tina\""), "应带固定音色");
+        assert!(req.contains("\"stream\":true"), "qwen 音频必须流式");
+        assert!(req.contains("\"modalities\":[\"text\",\"audio\"]"), "应声明音频输出");
+        assert!(req.to_lowercase().contains("bearer qwen-key"), "应带 Bearer 鉴权");
+        assert!(!dir.exists(), "不落盘");
+        unsafe {
+            std::env::remove_var("FURINA_TEST_QWEN_VOICE_KEY");
+        }
+    }
+
+    #[test]
+    fn synthesize_empty_text_fails() {
+        let dir = std::env::temp_dir();
+        let mut cfg = Config::default();
+        cfg.voice.enabled = true;
+        cfg.voice.reference_id = "m".into();
+        cfg.voice.api_key_env = "FURINA_TEST_VOICE_KEY".into();
+        unsafe {
+            std::env::set_var("FURINA_TEST_VOICE_KEY", "k");
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = VoiceClient::from_config(&cfg, &dir).unwrap();
+        let err = rt.block_on(client.synthesize("```\n```", "", 1.0)).unwrap_err().to_string();
+        assert!(err.contains("没有可合成"));
+        unsafe {
+            std::env::remove_var("FURINA_TEST_VOICE_KEY");
+        }
+    }
+
+    #[test]
+    fn pcm_to_wav_builds_valid_header() {
+        let pcm = vec![0u8; 100];
+        let wav = pcm_to_wav(&pcm, 24000);
+        assert_eq!(wav.len(), 44 + 100);
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]), 24000);
+        assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 1, "单声道");
+        assert_eq!(u16::from_le_bytes([wav[34], wav[35]]), 16, "16-bit");
+        assert_eq!(&wav[44..], pcm.as_slice());
+    }
+
+    /// 手动 E2E（需要真实 key，不进 CI）：
+    ///   cargo test -p furina-core qwen_tts_e2e_manual -- --ignored --nocapture
+    /// 环境变量 QWEN_API_KEY 需已设置（或由 furina 从 secrets.env 加载）。
+    #[tokio::test]
+    #[ignore]
+    async fn qwen_tts_e2e_manual() {
+        let key = std::env::var("QWEN_API_KEY").unwrap_or_default();
+        if key.is_empty() {
+            eprintln!("跳过：需要 QWEN_API_KEY");
+            return;
+        }
+        let mut cfg = Config::default();
+        cfg.voice.enabled = true;
+        cfg.voice.provider = "qwen".into();
+        let client = VoiceClient::from_config(&cfg, &std::env::temp_dir()).unwrap();
+        let bytes = client
+            .synthesize_bytes("你好呀，我是芙宁娜，今天也很开心见到你。", "happy", 1.0)
+            .await
+            .unwrap();
+        println!("Qwen TTS 字节数: {}，provider={}", bytes.len(), client.provider());
+        assert!(bytes.len() > 1000, "应返回可播放的 wav 音频");
+        assert_eq!(&bytes[..4], b"RIFF", "应为 RIFF wav");
+        assert_eq!(&bytes[8..12], b"WAVE", "应为 WAVE 容器");
+    }
+
+    /// 手动 E2E：fish.audio + 芙芙音色包（需 FISH_AUDIO_API_KEY 与 FURINA_VOICE_REFERENCE_ID）。
+    ///   cargo test -p furina-core fish_tts_e2e_manual -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn fish_tts_e2e_manual() {
+        let key = std::env::var("FISH_AUDIO_API_KEY").unwrap_or_default();
+        let rid = std::env::var("FURINA_VOICE_REFERENCE_ID").unwrap_or_default();
+        if key.is_empty() || rid.is_empty() {
+            eprintln!("跳过：需要 FISH_AUDIO_API_KEY 与 FURINA_VOICE_REFERENCE_ID");
+            return;
+        }
+        let mut cfg = Config::default();
+        cfg.voice.enabled = true;
+        cfg.voice.provider = "fish".into();
+        cfg.voice.model = "s2.1-pro-free".into();
+        let client = VoiceClient::from_config(&cfg, &std::env::temp_dir()).unwrap();
+        let bytes = client
+            .synthesize_bytes("哼，本神正忙着呢，舞台上的每一分钟都值得认真对待。", "proud", 1.0)
+            .await
+            .unwrap();
+        println!(
+            "fish TTS 字节数: {}，provider={}，音色={}",
+            bytes.len(),
+            client.provider(),
+            client.reference_id()
+        );
+        assert!(bytes.len() > 1000, "应返回可播放的音频");
+    }
+}

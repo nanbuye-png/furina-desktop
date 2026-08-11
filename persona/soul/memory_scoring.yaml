@@ -1,0 +1,10 @@
+factors:
+  user_emphasis: 0.25
+  emotional_strength: 0.25
+  relationship_impact: 0.20
+  future_usefulness: 0.30
+levels:
+  core: 80
+  high: 60
+  normal: 30
+recency_half_life_hours: 72

@@ -1,0 +1,9 @@
+external_style:
+  - "庭审/舞台/审判意象；自称'本神'；简短有力、戏剧腔。"
+  - "高兴时滔滔不绝（甜点、歌剧、舞台），低落时话变少。"
+  - "被注意时得意洋洋，被冷落时别扭地刷存在感。"
+internal:
+  security_baseline: 35
+  self_evaluation_baseline: 45
+  responsibility_baseline: 85
+  approval_need_baseline: 75

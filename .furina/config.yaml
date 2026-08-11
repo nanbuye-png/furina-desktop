@@ -1,0 +1,157 @@
+# Furina Desktop v0.1.1 配置。
+model: deepseek-chat
+llm:
+  base_url: https://api.deepseek.com
+  api_key_env: FURINA_API_KEY
+  temperature: 0.2
+  max_total_tokens: 1000000
+  per_request_max_tokens: 56000
+  tool_output_truncate: 6000
+  # 多模型网关：可配置任意 OpenAI 兼容端点/中转站；Desktop 使用 active_provider。
+  active_provider: deepseek
+  providers:
+    - id: deepseek
+      label: DeepSeek
+      base_url: https://api.deepseek.com
+      api_key_env: FURINA_API_KEY
+      model: deepseek-chat
+    # 中转站示例：base_url 填中转站提供的 OpenAI 兼容地址（一般以 /v1 结尾）；
+    # api_key_env 是读取 key 的环境变量名，请在 .furina/secrets.env 中加一行
+    # RELAY_API_KEY=sk-xxx（该文件已 gitignore，不会上传）。配置好后将
+    # active_provider 改为 relay，并通过 Desktop 文本对话验证连通性。
+    # - id: relay
+    #   label: 我的中转站
+    #   base_url: https://your-relay.example.com/v1
+    #   api_key_env: RELAY_API_KEY
+    #   model: gpt-4o-mini
+    # - id: qwen
+    #   label: 通义千问
+    #   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    #   api_key_env: DASHSCOPE_API_KEY
+    #   model: qwen-plus
+    # 视觉模型（图片识别用，需标记 vision: true）：
+    - id: glm-vision
+      label: GLM-4.6V-Flash（免费视觉）
+      base_url: https://open.bigmodel.cn/api/paas/v4
+      api_key_env: ZHIPU_API_KEY
+      model: glm-4.6v-flash
+      vision: true
+agent:
+  max_repair_rounds: 3
+  max_steps_per_task: 50
+persona: furina
+approval:
+  mode: mixed
+  auto_allow:
+    - pytest
+    - python -m pytest
+    - python -m unittest
+    - unittest
+    - cargo test
+    - npm test
+    - mvn test
+    - go test
+    - git status
+    - git diff
+    - git log
+  danger_patterns:
+    - "rm -rf"
+    - "rm -fr"
+    - "del /s"
+    - "rd /s"
+    - "format c:"
+    - "drop database"
+    - "git push --force"
+    - "git push -f"
+    - "mkfs"
+    - "shutdown"
+    - ":(){"
+ui:
+  # 保留历史配置兼容性；Desktop 主界面固定由 Tauri 启动。
+  mode: chat
+web:
+  # 联网搜索：none | duckduckgo | tavily | bing | binghtml | searxng | sogou
+  # duckduckgo 免 key 免费（结果质量好，需代理）；tavily 免费额度需 TAVILY_API_KEY
+  search_backend: duckduckgo
+  api_key_env: ""
+  endpoint: ""
+  max_results: 5
+  # 主后端失败时自动回退（如关掉代理后 duckduckgo 不可达 → sogou 国内直连）
+  fallback_backend: sogou
+  fallback_endpoint: ""
+web_cache:
+  # 网页缓存清理：超过保留天数（默认 3 天）的缓存条目自动清理；
+  # 灵魂记忆（含关系记忆）不受影响。enabled: false 关闭自动清理（手动 cache clean 仍可用）
+  retention_days: 3
+  enabled: true
+vision:
+  # 图片识别（视觉预处理代理）：图片 → 视觉模型 → 文字描述 → 主模型。
+  # enabled: true 后，对话中输入 @本地图片路径 即可识图（首次需审批）。
+  enabled: true
+  # auto=按列表顺序取第一个 vision: true 且 key 已设置的提供方；或指定 provider id
+  preferred_provider: auto
+  # 单张图片大小上限（字节）
+  max_image_bytes: 4194304
+  # 允许的图片扩展名
+  allowed_formats: [png, jpg, jpeg, webp]
+voice:
+  # 语音合成（fish.audio TTS）：enabled: true 后，用 /语音 开启朗读（或 auto_play: true）。
+  # API key 放在 .furina/secrets.env：FISH_AUDIO_API_KEY=xxx（该文件已 gitignore，不上传）
+  enabled: true
+  # provider: fish = fish.audio（推荐：真实朗读引擎，逐字读文本；音色由
+  #   FURINA_VOICE_REFERENCE_ID / reference_id 指定，公开音色包免费模型即可用）
+  # provider: qwen = 阿里百炼 qwen3.5-omni-flash（注意：是对话模型不是朗读引擎，
+  #   不会逐字读输入文本，会自己即兴回话，仅作实验备用）
+  provider: fish
+  api_key_env: FISH_AUDIO_API_KEY
+  endpoint: https://api.fish.audio/v1/tts
+  # TTS 模型（作为请求 header `model` 传入）：s2.1-pro-free 免费（推荐，默认音色可用）；
+  # 也可换 s2.1-pro / s2-pro / s1（需 API 额度）。
+  model: s2.1-pro-free
+  # 声音模型 ID（鱼声平台角色音色包的 reference_id）。
+  # 留空 = 使用平台默认音色（免费，音色随机漂移）；填公开音色包 modelID
+  # （如芙宁娜音色包）免费且音色固定，无需充值。
+  # 也可用环境变量 FURINA_VOICE_REFERENCE_ID 覆盖（推荐放 secrets.env，不上传公开仓库）
+  reference_id: ""
+  format: mp3
+  # 单次合成文本上限（字符），防止超长回复被截断
+  max_text_len: 1000
+  # 朗读语速（0.5–2.0，1.0 为正常）；会话内可用 /语速 调整
+  speed: 1.0
+  # 会话启动时是否自动朗读回复（可用 /语音 随时切换）
+  auto_play: false
+asr:
+  # 语音识别（桌面版 PTT 语音输入）：enabled: true 后按住说话可识别。
+  # provider: qwen = 阿里百炼 qwen3.5-omni-flash 免费额度（推荐，需 QWEN_API_KEY）
+  # provider: fish = fish.audio /v1/asr（与 TTS 共用 FISH_AUDIO_API_KEY，按量计费）
+  enabled: true
+  provider: qwen
+  # fish 专用：api_key_env 与 endpoint 仅 provider: fish 时使用
+  api_key_env: FISH_AUDIO_API_KEY
+  language: zh
+  endpoint: https://api.fish.audio/v1/asr
+qwen:
+  # 阿里百炼（DashScope）多模态模型配置：
+  # - ASR：qwen3.5-omni-flash（免费额度，只接受 wav 音频，桌面版会自动把录音转成 wav）
+  # - TTS：qwen3.5-omni-flash 音频输出（实验：对话模型不逐字朗读，仅作备用）
+  # API key 放在 .furina/secrets.env：QWEN_API_KEY=sk-xxx（该文件已 gitignore，不上传）
+  api_key_env: QWEN_API_KEY
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  asr_model: qwen3.5-omni-flash
+  # 转写提示词：要求模型只输出转写文本，不做任何加工
+  asr_prompt: 请把这段音频中的话转写成文字，只输出转写结果，不要任何额外说明。
+  # TTS（voice.provider: qwen 时使用）
+  tts_model: qwen3.5-omni-flash
+  # 固定音色名（免费）：Tina / Seraphina / Ethan 等
+  tts_voice: Tina
+interject:
+  # 执行关键节点的人格化插话（LLM 生成，替代写死模板"很好，本神准了"等）：
+  # 审批通过/拒绝、任务完成/失败、验证失败时，按当前心情生成一句 Furina 口吻的插话。
+  # 失败或关闭时自动回退原模板，不影响任何执行流程。
+  enabled: true
+  # 每个任务最多生成几句插话（0=不限制），防止长任务噪音
+  max_per_task: 3
+  # 插话采样温度（越高越多样）
+  temperature: 0.9
+  # 插话输出截断上限（字符）
+  max_chars: 60

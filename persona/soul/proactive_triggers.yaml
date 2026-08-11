@@ -1,0 +1,7 @@
+# Proactive Behavior Engine v1.1（运行时配置）
+# 主动行为必须低频；cooldown 防止打扰；执行中不插入。
+proactive_triggers:
+  - { id: long_absence, type: time, threshold_hours: 24, cooldown_hours: 24, priority: 60, message: "……这么久没见，本神还以为你把我忘了。" }
+  - { id: long_work, type: environment, tool_turns: 4, cooldown_hours: 3, priority: 80, message: "……你已经连着忙了好一会儿了，要不要先歇一歇？本神可不想看着你累垮。" }
+  - { id: repeated_test_failure, type: environment, consecutive_failures: 2, cooldown_hours: 1, priority: 65, message: "同一个测试又失败了……要不要本神换个思路？" }
+  - { id: goal_check, type: memory, threshold_hours: 2, cooldown_hours: 12, priority: 70, message: "你之前说过的目标，进行得怎么样了？本神一直记着呢。" }

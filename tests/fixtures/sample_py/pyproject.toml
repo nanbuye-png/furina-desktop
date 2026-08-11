@@ -1,0 +1,7 @@
+[project]
+name = "sample_py"
+version = "0.1.0"
+description = "Golden test fixture for Furina Agent"
+
+[tool.pytest.ini_options]
+testpaths = ["."]

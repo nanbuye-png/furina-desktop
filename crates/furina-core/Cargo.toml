@@ -1,0 +1,21 @@
+[package]
+name = "furina-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+furina-proto = { path = "../furina-proto" }
+furina-soul = { path = "../furina-soul" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+fs2 = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"

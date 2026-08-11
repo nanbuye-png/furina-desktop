@@ -1,0 +1,18 @@
+[package]
+name = "furina-desktop"
+version.workspace = true
+edition.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+furina-core = { path = "../../crates/furina-core" }
+furina-proto = { path = "../../crates/furina-proto" }
+furina-soul = { path = "../../crates/furina-soul" }
+tauri = { version = "2", features = [] }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
