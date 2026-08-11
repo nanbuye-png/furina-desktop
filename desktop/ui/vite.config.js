@@ -6,6 +6,7 @@ export default defineConfig({
   plugins: [react()],
   base: "./",
   build: { outDir: "dist", emptyOutDir: true },
+  test: { environment: "node" },
   server: { port: 1420, strictPort: true },
   clearScreen: false,
 });

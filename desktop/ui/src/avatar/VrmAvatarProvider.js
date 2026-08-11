@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { VRMLoaderPlugin } from "@pixiv/three-vrm";
+import { fixHairHighlightOverlay } from "./hairMaterialFix.js";
 
 const MOOD_EXPRESSIONS = {
   calm: { relaxed: 0.18 },
@@ -72,6 +73,7 @@ export class VrmAvatarProvider {
     if (!vrm) throw new Error("文件中没有可用的 VRM 数据");
     if (this.vrm) this.removeCurrentVrm();
     this.vrm = vrm;
+    fixHairHighlightOverlay(vrm.scene);
     this.scene.add(vrm.scene);
     this.frameAvatar();
     this.applyState(0, true);
