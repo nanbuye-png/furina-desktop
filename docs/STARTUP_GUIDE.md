@@ -88,11 +88,12 @@ Desktop 只在自身 `.furina` 目录内维护本地状态：
 ## 9. 验证命令
 
 ```powershell
+Set-Location desktop\ui
+npm run build
+Set-Location ..\..
 cargo metadata --no-deps --format-version 1
 cargo test --workspace
 python -m unittest discover -s python/furina_tools/tests -v
-Set-Location desktop\ui
-npm run build
 ```
 
 Cargo workspace 和所有本地 path dependency 必须位于 `Furina_Desktop` 内。
