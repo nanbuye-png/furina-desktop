@@ -72,6 +72,8 @@ pub struct IdentityConfig {
 #[serde(default)]
 pub struct PersonalityConfig {
     pub external_style: Vec<String>,
+    pub expression_styles: HashMap<String, String>,
+    pub reply_budgets: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -119,8 +121,8 @@ pub struct MoodRule {
 pub struct BehaviorRulesConfig {
     pub text_triggers: Vec<TextTriggerConfig>,
     pub event_triggers: Vec<EventTriggerConfig>,
-    /// 表达策略选择规则（theatrical / casual / gentle / serious 等）：
-    /// 顺序即优先级，第一条同时满足心情与信任范围者生效；is_default 兜底。
+    /// 表达策略选择规则（natural / playful / flustered / gentle / serious / theatrical）：
+    /// 顺序即优先级，第一条同时满足意图、心情与信任范围者生效；is_default 兜底。
     #[serde(default)]
     pub expression_strategies: Vec<ExpressionStrategyConfig>,
 }
@@ -132,6 +134,9 @@ pub struct ExpressionStrategyConfig {
     /// 适用心情列表；空 = 不限心情。
     #[serde(default)]
     pub moods: Vec<String>,
+    /// 适用行为意图；空 = 不限意图。
+    #[serde(default)]
+    pub intents: Vec<String>,
     #[serde(default)]
     pub min_trust: Option<f64>,
     #[serde(default)]
@@ -269,6 +274,25 @@ mod tests {
         assert!(!cfg.emotion_model.dimensions.is_empty());
         assert!(!cfg.behavior_rules.text_triggers.is_empty());
         assert!(!cfg.relationship_model.stages.is_empty());
+    }
+
+    #[test]
+    fn expression_strategy_configs_are_complete_and_unique() {
+        let cfg = load();
+        let strategies = &cfg.behavior_rules.expression_strategies;
+        let expected = ["natural", "playful", "flustered", "gentle", "serious", "theatrical"];
+        for id in expected {
+            assert!(strategies.iter().any(|strategy| strategy.id == id), "缺少表达策略 {id}");
+            assert!(cfg.personality.expression_styles.contains_key(id), "缺少 {id} 风格说明");
+            assert!(cfg.personality.reply_budgets.contains_key(id), "缺少 {id} 回复预算");
+        }
+        assert_eq!(strategies.iter().filter(|strategy| strategy.is_default).count(), 1);
+        assert_eq!(strategies.iter().find(|strategy| strategy.is_default).unwrap().id, "natural");
+
+        assert!(
+            strategies.iter().all(|strategy| expected.contains(&strategy.id.as_str())),
+            "表达规则不得引用未知策略"
+        );
     }
 
     #[test]

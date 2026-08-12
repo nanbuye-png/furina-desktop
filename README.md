@@ -2,13 +2,13 @@
 
 > 一个拥有稳定人格、长期记忆、情绪连续性与关系成长能力的桌面 AI 生命体。
 
-[![Version](https://img.shields.io/badge/version-0.1.1-5b8cff)](https://github.com/nanbuye-png/furina-desktop/releases/tag/desktop-v0.1.1) [![Desktop](https://img.shields.io/badge/Desktop-Tauri%202-24c8db)](https://v2.tauri.app/) [![Frontend](https://img.shields.io/badge/UI-React%20%2B%20Vite-646cff)](desktop/ui) [![Core](https://img.shields.io/badge/Core-Rust-ce412b)](crates/furina-core)
+![Version](https://img.shields.io/badge/version-0.1.3--dev-5b8def) [![Desktop](https://img.shields.io/badge/Desktop-Tauri%202-24c8db)](https://v2.tauri.app/) [![Frontend](https://img.shields.io/badge/UI-React%20%2B%20Vite-646cff)](desktop/ui) [![Core](https://img.shields.io/badge/Core-Rust-ce412b)](crates/furina-core)
 
 Furina Desktop 是 Furina Personal AI Lifeform 的独立桌面实现。她不只是普通聊天窗口：本地 Runtime 维护人格、情绪、关系和记忆，大语言模型负责生成语言，工具系统负责执行任务，权限网关负责守住边界。
 
 项目原则：**人格是灵魂，Runtime 是大脑，工具是双手，安全是边界，验证是生命线。**
 
-历史 Furina Agent CLI 已冻结在 [nanbuye-png/furina-agent](https://github.com/nanbuye-png/furina-agent) 的 Tag/Release 中；本仓库自 v0.1.1 起是唯一后续开发主线，不读取或共享 CLI 的本地历史数据。
+历史 Furina Agent CLI 已冻结在 [nanbuye-png/furina-agent](https://github.com/nanbuye-png/furina-agent) 的 Tag/Release 中；本仓库自 v0.1.1 起是唯一后续开发主线。Desktop v0.1.2 已完成功能验收，当前进入 **Desktop v0.1.3 Persona 开发阶段**，不读取或共享 CLI 的本地历史数据。
 
 ## 目录
 
@@ -17,6 +17,7 @@ Furina Desktop 是 Furina Personal AI Lifeform 的独立桌面实现。她不只
 - [主要能力](#主要能力)
 - [架构](#架构)
 - [项目结构](#项目结构)
+- [发布版使用](#发布版使用)
 - [快速开始](#快速开始)
 - [使用说明](#使用说明)
 - [配置](#配置)
@@ -32,7 +33,7 @@ Furina Desktop 是 Furina Personal AI Lifeform 的独立桌面实现。她不只
 
 | 项目 | 状态 |
 | --- | --- |
-| 当前版本 | **Desktop v0.1.1** |
+| 当前版本 | **Desktop v0.1.3 Persona（开发中）** |
 | 开发主线 | 本仓库 `main` |
 | 桌面框架 | Tauri 2 |
 | 前端 | React 18 + Vite 5 |
@@ -43,7 +44,9 @@ Furina Desktop 是 Furina Personal AI Lifeform 的独立桌面实现。她不只
 | Desktop 独立启动 | 已验证 |
 | CLI 数据共享 | **不共享** |
 
-2026-08-11 分离验收结果：Rust 147 项测试通过、Python 27 项测试通过、React/Vite 生产构建通过，并在删除本地 CLI 目录后完成 Desktop 独立启动检查。
+v0.1.3 的当前重点是数字化身份、现实边界、自然短回复和动态表达策略。普通闲聊默认 1–3 句，舞台语气仅在明确表演请求或特殊角色话题中启用。
+
+2026-08-11 分离验收结果：Rust 156 项测试通过、Python 28 项测试通过、React/Vite 生产构建通过，并在删除本地 CLI 目录后完成 Desktop 独立启动检查。
 
 ## 项目定位
 
@@ -150,15 +153,26 @@ Furina_Desktop/
 │   ├── furina-proto/
 │   └── furina-soul/
 ├── desktop/
-│   ├── src-tauri/               # Tauri 后端
+│   ├── resources/               # 安装/便携默认资源
+│   ├── src-tauri/               # Tauri 后端与 NSIS 配置
 │   └── ui/                      # React + Vite 前端
 ├── docs/                        # 架构、启动、语音和 Avatar 文档
 ├── persona/                     # 人格配置与系统提示词
 ├── python/furina_tools/         # Python sidecar
+├── scripts/                     # sidecar 与便携包构建脚本
 ├── tests/                       # fixtures 与黄金场景
 ├── Cargo.toml
 └── Cargo.lock
 ```
+
+## 发布版使用
+
+v0.1.2 RC1 面向 Windows x64，当前本地候选构建提供两类未签名产物：
+
+- `Furina-Desktop-0.1.2-x64-Setup.exe`：NSIS 当前用户安装器，运行数据写入应用专属 AppData；卸载默认保留配置、密钥和记忆。
+- `Furina-Desktop-0.1.2-x64-Portable.zip`：解压后直接运行，`portable.flag` 使数据写入同目录的 `data`。
+
+首次启动会依次完成旧 Desktop 数据检测、LLM 配置、可选语音配置、可选 VRM 导入和诊断。项目与候选包均不包含用户 VRM、API Key、记忆或缓存。未签名版本可能触发 Windows SmartScreen；RC1 请使用本地 `dist/SHA256SUMS.txt` 校验，正式公开测试版通过验收后再上传 GitHub Release。
 
 ## 快速开始
 
@@ -306,6 +320,10 @@ Desktop 默认以仓库根目录作为工具工作区。需要操作其他项目
 
 ## 开发与测试
 
+### 发布构建
+
+`scripts/build-sidecar.ps1` 使用 PyInstaller 生成独立 sidecar；Tauri bundle 生成 NSIS 安装器；`scripts/build-portable.ps1` 组装便携 ZIP。Tag `desktop-v*` 会由 GitHub Actions 执行完整测试、生成 SHA-256 并发布 Release。
+
 ### 推荐验证顺序
 
 ```powershell
@@ -325,10 +343,14 @@ python -m unittest discover -s python/furina_tools/tests -v
 
 ### 当前基线
 
-- Rust：147 项通过，4 项需要真实外部服务的手动 E2E 测试默认忽略。
-- Python sidecar：27 项通过。
+- Rust：156 项通过，4 项需要真实外部服务的手动 E2E 测试默认忽略。
+- Python sidecar：28 项通过。
 - React/Vite：生产构建通过。
 - Desktop：在不存在本地 Furina Agent CLI 目录的情况下可独立启动。
+
+### RC1 验收
+
+v0.1.2 的 Windows Sandbox 验收流程与历史结果保留在 [docs/RC_ACCEPTANCE_TEST_0.1.2.md](docs/RC_ACCEPTANCE_TEST_0.1.2.md)。v0.1.3 人格回归使用 [docs/PERSONA_V2_ACCEPTANCE.md](docs/PERSONA_V2_ACCEPTANCE.md) 与 `tests/persona/persona_v2_cases.yaml`。
 
 ## 文档导航
 
@@ -336,6 +358,8 @@ python -m unittest discover -s python/furina_tools/tests -v
 | --- | --- |
 | [docs/README.md](docs/README.md) | 文档总索引与阅读顺序 |
 | [docs/STARTUP_GUIDE.md](docs/STARTUP_GUIDE.md) | 安装、配置、启动、Avatar 与故障排查 |
+| [docs/RC_ACCEPTANCE_TEST_0.1.2.md](docs/RC_ACCEPTANCE_TEST_0.1.2.md) | Windows Sandbox RC1 验收、稳定性监控与发布门禁 |
+| [docs/PERSONA_V2_ACCEPTANCE.md](docs/PERSONA_V2_ACCEPTANCE.md) | v0.1.3 人格、现实边界和短回复回归验收 |
 | [docs/FURINA_DESKTOP_UI_SPEC_V1.md](docs/FURINA_DESKTOP_UI_SPEC_V1.md) | Desktop 分层架构、状态协议、事件协议和 UI 边界 |
 | [docs/FURINA_PROJECT_FREEZE_REPORT.md](docs/FURINA_PROJECT_FREEZE_REPORT.md) | 当前冻结接口、稳定层和开发边界 |
 | [docs/FURINA_SOUL_ROADMAP.md](docs/FURINA_SOUL_ROADMAP.md) | Soul Engine 长期演进路线 |
@@ -350,7 +374,8 @@ python -m unittest discover -s python/furina_tools/tests -v
 - ASR、TTS、LLM、视觉和部分搜索能力依赖第三方服务与网络。
 - Qwen Omni 更适合 ASR；其 TTS 输出不是严格逐字朗读，仅作为实验路径保留。
 - VRM 资产不随仓库发布，需用户自行准备合法资源。
-- 当前没有安装器或自动更新器，主要通过源码启动。
+- 当前 RC1 已生成未签名 NSIS 安装器和便携 ZIP；Windows SmartScreen 可能提示未知发布者。
+- 当前没有自动更新器，代码签名与自动更新计划在后续版本处理。
 
 ## 路线图
 

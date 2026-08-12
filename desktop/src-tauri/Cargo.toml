@@ -11,8 +11,10 @@ furina-core = { path = "../../crates/furina-core" }
 furina-proto = { path = "../../crates/furina-proto" }
 furina-soul = { path = "../../crates/furina-soul" }
 tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 tokio = { workspace = true }

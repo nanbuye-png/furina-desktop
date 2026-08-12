@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"主窗口能力：核心插件默认权限（含事件监听/窗口/路径等）+ 自定义命令","local":true,"windows":["main"],"permissions":["core:default"]}}
+{"default":{"identifier":"default","description":"主窗口能力：核心插件默认权限（含事件监听/窗口/路径等）+ 自定义命令","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open"]}}

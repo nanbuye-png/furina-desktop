@@ -21,7 +21,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub struct VoiceClient {
     client: reqwest::Client,
     kind: VoiceKind,
-    /// 输出格式：fish 为 mp3/wav/flac；qwen 固定 wav。
+    provider: String,
+    /// 输出格式：fish/openai 为配置值；qwen_omni 固定 wav。
     format: String,
     max_text_len: usize,
     output_dir: PathBuf,
@@ -41,6 +42,12 @@ enum VoiceKind {
         model: String,
         voice: String,
     },
+    OpenAi {
+        api_key: String,
+        endpoint: String,
+        model: String,
+        voice: String,
+    },
 }
 
 impl VoiceClient {
@@ -49,66 +56,62 @@ impl VoiceClient {
         if !cfg.voice.enabled {
             anyhow::bail!("语音合成未启用（config.yaml 中 voice.enabled: true 后可启用）");
         }
-        let provider = cfg.voice.provider.trim().to_lowercase();
+        let provider = cfg.voice.provider.trim().to_string();
+        let protocol = voice_protocol(cfg);
         let client = apply_system_proxy(
             reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
                 .timeout(Duration::from_secs(120)),
         )
         .build()?;
-        let (kind, format) = match provider.as_str() {
+        let (kind, format) = match protocol.as_str() {
             "fish" => {
                 let api_key = env_key(&cfg.voice.api_key_env, "FISH_AUDIO_API_KEY")?;
-                // 音色 ID 解析顺序：环境变量 FURINA_VOICE_REFERENCE_ID（推荐放 secrets.env，不上传）
-                // → config.yaml 的 voice.reference_id。留空时 fish 免费模型使用随机默认音色。
                 let reference_id = std::env::var("FURINA_VOICE_REFERENCE_ID")
                     .ok()
-                    .map(|v| v.trim().to_string())
-                    .filter(|v| !v.is_empty())
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| cfg.voice.reference_id.trim().to_string());
-                let model = {
-                    let m = cfg.voice.model.trim().to_string();
-                    if m.is_empty() { "s2.1-pro-free".into() } else { m }
-                };
-                let format = {
-                    let f = cfg.voice.format.trim().to_lowercase();
-                    if f.is_empty() { "mp3".into() } else { f }
-                };
-                (
-                    VoiceKind::Fish {
-                        api_key,
-                        endpoint: cfg.voice.endpoint.trim_end_matches('/').to_string(),
-                        model,
-                        reference_id,
-                    },
-                    format,
-                )
+                let model = required_or(&cfg.voice.model, "s2.1-pro-free", "TTS 模型")?;
+                let endpoint = required(&cfg.voice.endpoint, "TTS API 地址")?;
+                let format = value_or(&cfg.voice.format, "mp3").to_lowercase();
+                (VoiceKind::Fish { api_key, endpoint, model, reference_id }, format)
             }
-            "qwen" => {
-                let api_key = env_key(&cfg.qwen.api_key_env, "QWEN_API_KEY")?;
-                let model = {
-                    let m = cfg.qwen.tts_model.trim().to_string();
-                    if m.is_empty() { "qwen3.5-omni-flash".into() } else { m }
+            "qwen_omni" => {
+                let legacy = cfg.voice.protocol.trim().is_empty();
+                let api_key_env = if legacy { &cfg.qwen.api_key_env } else { &cfg.voice.api_key_env };
+                let api_key = env_key(api_key_env, "QWEN_API_KEY")?;
+                let endpoint = if legacy {
+                    required(&cfg.qwen.base_url, "Qwen API 地址")?
+                } else {
+                    required_or(&cfg.voice.endpoint, &cfg.qwen.base_url, "Qwen API 地址")?
                 };
-                let voice = {
-                    let v = cfg.qwen.tts_voice.trim().to_string();
-                    if v.is_empty() { "Tina".into() } else { v }
+                let model = if legacy {
+                    required_or(&cfg.qwen.tts_model, "qwen3.5-omni-flash", "TTS 模型")?
+                } else {
+                    required_or(&cfg.voice.model, &cfg.qwen.tts_model, "TTS 模型")?
                 };
-                (
-                    VoiceKind::Qwen {
-                        api_key,
-                        base_url: cfg.qwen.base_url.trim_end_matches('/').to_string(),
-                        model,
-                        voice,
-                    },
-                    "wav".into(),
-                )
+                let voice = if legacy {
+                    required_or(&cfg.qwen.tts_voice, "Tina", "TTS 音色")?
+                } else {
+                    required_or(&cfg.voice.voice, &cfg.qwen.tts_voice, "TTS 音色")?
+                };
+                (VoiceKind::Qwen { api_key, base_url: endpoint, model, voice }, "wav".into())
             }
-            other => anyhow::bail!("未知 TTS provider: {other}（支持 fish / qwen）"),
+            "openai" => {
+                let api_key = env_key(&cfg.voice.api_key_env, "FURINA_TTS_API_KEY")?;
+                let endpoint = required(&cfg.voice.endpoint, "TTS API 地址")?;
+                let model = required(&cfg.voice.model, "TTS 模型")?;
+                let voice = required(&cfg.voice.voice, "TTS 音色")?;
+                let format = value_or(&cfg.voice.format, "mp3").to_lowercase();
+                (VoiceKind::OpenAi { api_key, endpoint, model, voice }, format)
+            }
+            other => anyhow::bail!("未知 TTS protocol: {other}（支持 fish / qwen_omni / openai）"),
         };
         Ok(Self {
             client,
             kind,
+            provider: if provider.is_empty() { protocol } else { provider },
             format,
             max_text_len: cfg.voice.max_text_len.max(10),
             output_dir: output_dir.to_path_buf(),
@@ -116,10 +119,7 @@ impl VoiceClient {
     }
 
     pub fn provider(&self) -> &str {
-        match self.kind {
-            VoiceKind::Fish { .. } => "fish",
-            VoiceKind::Qwen { .. } => "qwen",
-        }
+        &self.provider
     }
 
     /// 输出格式（mp3 / wav），用于文件名与前端播放类型。
@@ -132,6 +132,7 @@ impl VoiceClient {
         match &self.kind {
             VoiceKind::Fish { reference_id, .. } => reference_id,
             VoiceKind::Qwen { voice, .. } => voice,
+            VoiceKind::OpenAi { voice, .. } => voice,
         }
     }
 
@@ -139,6 +140,7 @@ impl VoiceClient {
         match &self.kind {
             VoiceKind::Fish { model, .. } => model,
             VoiceKind::Qwen { model, .. } => model,
+            VoiceKind::OpenAi { model, .. } => model,
         }
     }
 
@@ -211,6 +213,9 @@ impl VoiceClient {
             VoiceKind::Qwen { api_key, base_url, model, voice } => {
                 self.request_qwen(&cleaned, api_key, base_url, model, voice).await
             }
+            VoiceKind::OpenAi { api_key, endpoint, model, voice } => {
+                self.request_openai(&cleaned, speed, api_key, endpoint, model, voice).await
+            }
         }
     }
 
@@ -256,6 +261,39 @@ impl VoiceClient {
         if bytes.is_empty() {
             anyhow::bail!("语音 API 返回空音频");
         }
+        Ok(bytes.to_vec())
+    }
+
+    /// OpenAI-compatible Audio Speech：JSON 请求，直接返回音频字节。
+    async fn request_openai(
+        &self,
+        payload: &str,
+        speed: f64,
+        api_key: &str,
+        endpoint: &str,
+        model: &str,
+        voice: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        let body = json!({
+            "model": model,
+            "input": payload,
+            "voice": voice,
+            "response_format": self.format,
+            "speed": speed.clamp(0.25, 4.0),
+        });
+        let resp = self.client.post(endpoint).bearer_auth(api_key).json(&body).send().await?;
+        let status = resp.status();
+        let content_type = resp.headers().get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()).unwrap_or("").to_ascii_lowercase();
+        if !status.is_success() || content_type.contains("application/json") {
+            let text = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                anyhow::bail!("TTS API 错误 {status}: {}", short(&text));
+            }
+            anyhow::bail!("TTS API 返回了 JSON 而不是音频: {}", short(&text));
+        }
+        let bytes = resp.bytes().await?;
+        if bytes.is_empty() { anyhow::bail!("TTS API 返回空音频"); }
         Ok(bytes.to_vec())
     }
 
@@ -341,6 +379,39 @@ fn pcm_to_wav(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
     out.extend_from_slice(&data_len.to_le_bytes());
     out.extend_from_slice(pcm);
     out
+}
+
+fn voice_protocol(cfg: &Config) -> String {
+    let explicit = cfg.voice.protocol.trim().to_lowercase();
+    if !explicit.is_empty() {
+        return match explicit.as_str() {
+            "fish_tts" => "fish".into(),
+            "qwen" | "openai_chat_audio" => "qwen_omni".into(),
+            "openai_speech" => "openai".into(),
+            _ => explicit,
+        };
+    }
+    match cfg.voice.provider.trim().to_lowercase().as_str() {
+        "fish" => "fish".into(),
+        "qwen" => "qwen_omni".into(),
+        _ => "openai".into(),
+    }
+}
+
+fn required(value: &str, label: &str) -> anyhow::Result<String> {
+    let value = value.trim();
+    if value.is_empty() { anyhow::bail!("{label}不能为空"); }
+    Ok(value.trim_end_matches('/').to_string())
+}
+
+fn required_or(value: &str, fallback: &str, label: &str) -> anyhow::Result<String> {
+    let selected = if value.trim().is_empty() { fallback } else { value };
+    required(selected, label)
+}
+
+fn value_or(value: &str, fallback: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() { fallback.into() } else { value.into() }
 }
 
 fn env_key(var: &str, fallback: &str) -> anyhow::Result<String> {
@@ -514,20 +585,45 @@ mod tests {
     }
 
     #[test]
-    fn unknown_provider_rejected() {
+    fn unknown_protocol_rejected() {
         let mut cfg = Config::default();
         cfg.voice.enabled = true;
-        cfg.voice.provider = "nope".into();
-        unsafe {
-            std::env::set_var("FISH_AUDIO_API_KEY", "k");
-        }
+        cfg.voice.provider = "Custom Service".into();
+        cfg.voice.protocol = "nope".into();
         let err = VoiceClient::from_config(&cfg, &std::env::temp_dir())
             .unwrap_err()
             .to_string();
-        assert!(err.contains("未知 TTS provider"), "{err}");
-        unsafe {
-            std::env::remove_var("FISH_AUDIO_API_KEY");
-        }
+        assert!(err.contains("未知 TTS protocol"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn openai_speech_uses_custom_endpoint_model_and_voice() {
+        let audio = b"ID3 openai audio".to_vec();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let addr = spawn_http_mock(200, audio.clone(), captured.clone());
+        let mut cfg = Config::default();
+        cfg.voice.enabled = true;
+        cfg.voice.provider = "My TTS".into();
+        cfg.voice.protocol = "openai".into();
+        cfg.voice.endpoint = format!("http://{addr}/v1/audio/speech");
+        cfg.voice.model = "custom-tts-model".into();
+        cfg.voice.voice = "furina-voice".into();
+        cfg.voice.format = "mp3".into();
+        cfg.voice.api_key_env = "FURINA_TEST_OPENAI_TTS_KEY".into();
+        unsafe { std::env::set_var("FURINA_TEST_OPENAI_TTS_KEY", "openai-key"); }
+        let client = VoiceClient::from_config(&cfg, &std::env::temp_dir()).unwrap();
+        assert_eq!(client.provider(), "My TTS");
+        let bytes = client.synthesize_bytes("你好", "happy", 1.25).await.unwrap();
+        assert_eq!(bytes, audio);
+        let request = captured.lock().unwrap().clone();
+        assert!(request.contains("/v1/audio/speech"), "{request}");
+        assert!(request.contains("custom-tts-model"), "{request}");
+        assert!(request.contains("furina-voice"), "{request}");
+        assert!(request.contains("response_format"), "{request}");
+        assert!(request.contains("\"input\":\"你好\""), "{request}");
+        assert!(!request.contains("[happy]"), "通用协议不应注入 Fish 情绪标签");
+        assert!(request.to_lowercase().contains("bearer openai-key"), "{request}");
+        unsafe { std::env::remove_var("FURINA_TEST_OPENAI_TTS_KEY"); }
     }
 
     #[test]

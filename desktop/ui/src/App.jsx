@@ -5,6 +5,7 @@ import { projectEmotions } from "./lib/projection.js";
 import { PcmRecorder } from "./lib/asr.js";
 import { TtsPipeline } from "./lib/tts.js";
 import AvatarStage from "./avatar/AvatarStage.jsx";
+import SetupWizard from "./SetupWizard.jsx";
 
 const MOOD_LABELS = {
   calm: "淡定",
@@ -58,6 +59,8 @@ export default function App() {
   const [speaking, setSpeaking] = useState(false);
   const [toolLog, setToolLog] = useState([]);
   const [memories, setMemories] = useState([]);
+  const [setupStatus, setSetupStatus] = useState(null);
+  const [showSetup, setShowSetup] = useState(false);
 
   const speedRef = useRef(1.0);
   const soulRef = useRef(null);
@@ -67,6 +70,18 @@ export default function App() {
   useEffect(() => {
     soulRef.current = soul;
   }, [soul]);
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke("get_setup_status")
+      .then((status) => {
+        if (cancelled) return;
+        setSetupStatus(status);
+        if (status?.needsSetup) setShowSetup(true);
+      })
+      .catch((error) => pushMsg({ kind: "status", text: "⚠️ 设置状态读取失败：" + error }));
+    return () => { cancelled = true; };
+  }, []);
 
   const streamRef = useRef(new StreamBuffer());
   const currentAssistantRef = useRef(null);
@@ -133,17 +148,16 @@ export default function App() {
           }
           break;
         case "scan":
-          pushMsg({
-            kind: "status",
-            text:
-              "📋 项目勘察：" +
-              (ev.project_type || "") +
-              "，测试：" +
-              (ev.test_command || ""),
-          });
+          setToolLog((log) =>
+            [
+              ...log,
+              "[勘察] " +
+                (ev.project_type || "未知项目") +
+                (ev.test_command ? "，测试：" + ev.test_command : ""),
+            ].slice(-200)
+          );
           break;
         case "tool_call":
-          pushMsg({ kind: "status", text: "⚙️ " + (ev.name || "") });
           setToolLog((l) =>
             [...l, "[工具] " + (ev.name || "") + " " + (ev.summary || "")].slice(-200)
           );
@@ -166,16 +180,21 @@ export default function App() {
           );
           break;
         case "test_report":
-          pushMsg({
-            kind: "status",
-            text: ev.passed ? "🧪 测试通过" : "🧪 测试未通过，正在修复…",
-          });
+          setToolLog((log) =>
+            [...log, ev.passed ? "[测试] 通过" : "[测试] 未通过"].slice(-200)
+          );
+          if (!ev.passed)
+            pushMsg({ kind: "status", text: "⚠️ 测试未通过，正在修复…" });
           break;
         case "verify":
-          pushMsg({ kind: "status", text: ev.passed ? "✅ 验证通过" : "❌ 验证未通过" });
+          setToolLog((log) =>
+            [...log, ev.passed ? "[验证] 通过" : "[验证] 未通过"].slice(-200)
+          );
+          if (!ev.passed)
+            pushMsg({ kind: "status", text: "⚠️ 验证未通过" });
           break;
         case "approval_required":
-          pushMsg({ kind: "status", text: "⏳ 等待你的审批…" });
+          // 审批弹窗已经提供明确反馈，不在聊天区重复显示流程胶囊。
           break;
         case "approval_granted":
           // 人格化插话以 interjection 气泡到达，不显示固定状态行
@@ -243,6 +262,13 @@ export default function App() {
     }
   }
 
+  function openSettings() {
+    if (recording) { pushMsg({ kind: "status", text: "⚠️ 录音期间不能重新加载设置。" }); return; }
+    if (thinking || approval) { pushMsg({ kind: "status", text: "⚠️ Furina 正在处理任务或等待审批，请稍后再打开设置。" }); return; }
+    ttsRef.current?.stop();
+    setShowSetup(true);
+  }
+
   async function startRecord() {
     ttsRef.current?.stop();
     const ok = await recorderRef.current.start();
@@ -253,7 +279,6 @@ export default function App() {
     const wav = recorderRef.current.stop();
     setRecording(false);
     if (!wav) return;
-    pushMsg({ kind: "status", text: "🎙️ 正在识别…" });
     try {
       const text = await invoke("transcribe", {
         audio: Array.from(wav),
@@ -310,6 +335,7 @@ export default function App() {
             : "正在加载灵魂状态…"}
         </div>
         <div className="controls">
+          <button className="settings-button" onClick={openSettings} disabled={recording || thinking || Boolean(approval)}>设置</button>
           <label className="toggle">
             <input
               type="checkbox"
@@ -395,6 +421,13 @@ export default function App() {
 
       {thinking && <div className="thinking">💭 Furina 正在思考中…</div>}
       {recording && <div className="thinking rec">🎙️ 正在听…松开发送</div>}
+      {showSetup && setupStatus && (
+        <SetupWizard
+          initialStatus={setupStatus}
+          onUpdated={setSetupStatus}
+          onClose={() => setShowSetup(false)}
+        />
+      )}
     </div>
   );
 }

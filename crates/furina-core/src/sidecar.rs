@@ -3,6 +3,7 @@
 
 use furina_proto::{Event, RpcMessage, RpcNotification, RpcRequest};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,24 +18,62 @@ pub trait EventSink: Send + Sync {
     fn emit(&self, event: Event);
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SidecarLaunch {
+    Python { executable: String, python_path: PathBuf },
+    Executable(PathBuf),
+    Disabled(PathBuf),
+}
+
+impl SidecarLaunch {
+    pub fn available(&self) -> bool {
+        match self {
+            Self::Python { .. } => true,
+            Self::Executable(path) => path.is_file(),
+            Self::Disabled(_) => false,
+        }
+    }
+
+    pub fn description(&self) -> String {
+        match self {
+            Self::Python { executable, .. } => format!("python:{executable}"),
+            Self::Executable(path) => path.display().to_string(),
+            Self::Disabled(_) => "disabled-fallback".into(),
+        }
+    }
+}
+
 pub struct Sidecar {
     stdin: ChildStdin,
     pending: Pending,
     next_id: AtomicU64,
+    version: String,
     notify: Arc<dyn Fn(RpcNotification) + Send + Sync>,
     _child: Child,
 }
 
 impl Sidecar {
     pub async fn spawn(
-        python: &str,
-        pythonpath: &str,
+        launch: &SidecarLaunch,
         workspace: &str,
         events: Arc<dyn EventSink>,
     ) -> anyhow::Result<Self> {
-        let mut child = Command::new(python)
-            .args(["-m", "furina_tools.server"])
-            .env("PYTHONPATH", pythonpath)
+        let mut command = match launch {
+            SidecarLaunch::Python { executable, python_path } => {
+                let mut command = Command::new(executable);
+                command
+                    .args(["-m", "furina_tools.server"])
+                    .env("PYTHONPATH", python_path);
+                command
+            }
+            SidecarLaunch::Executable(path) => Command::new(path),
+            SidecarLaunch::Disabled(path) => {
+                let mut command = Command::new(path);
+                command.arg("--furina-disabled-sidecar");
+                command
+            },
+        };
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -123,6 +162,7 @@ impl Sidecar {
             stdin,
             pending,
             next_id: AtomicU64::new(1),
+            version: String::new(),
             notify,
             _child: child,
         };
@@ -132,6 +172,7 @@ impl Sidecar {
         if res.get("ok").and_then(|v| v.as_bool()) != Some(true) {
             anyhow::bail!("sidecar initialize 失败: {res}");
         }
+        this.version = res.get("version").and_then(|value| value.as_str()).unwrap_or("unknown").to_string();
         Ok(this)
     }
 
@@ -148,6 +189,10 @@ impl Sidecar {
             .await
             .map_err(|_| anyhow::anyhow!("sidecar 调用超时: {method}"))??;
         res.map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
     }
 
     pub fn notify_clone(&self) -> Arc<dyn Fn(RpcNotification) + Send + Sync> {

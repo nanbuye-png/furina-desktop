@@ -94,17 +94,26 @@ impl Soul {
         self.relationship.stage(&self.cfg.relationship_model, self.emotion.trust)
     }
 
-    /// 表达策略（theatrical / casual / gentle / serious）：
-    /// 由 behavior_rules.yaml 的 expression_strategies 规则按心情×信任选择；
+    /// 表达策略（natural / playful / flustered / gentle / serious / theatrical）：
+    /// 由 behavior_rules.yaml 的 expression_strategies 规则按意图×心情×信任选择；
     /// 只影响语气与表达风格，不影响任何判断。
     pub fn expression_strategy(&self) -> String {
         let mood = self.mood().as_str();
         let trust = self.emotion.trust;
-        for s in &self.cfg.behavior_rules.expression_strategies {
+        let intent = self.last_intent.as_ref().map(|info| info.intent.as_str());
+        for s in self
+            .cfg
+            .behavior_rules
+            .expression_strategies
+            .iter()
+            .filter(|strategy| !strategy.is_default)
+        {
             let mood_ok = s.moods.is_empty() || s.moods.iter().any(|m| m == mood);
+            let intent_ok = s.intents.is_empty()
+                || intent.is_some_and(|current| s.intents.iter().any(|item| item == current));
             let min_ok = s.min_trust.map_or(true, |t| trust >= t);
             let max_ok = s.max_trust.map_or(true, |t| trust <= t);
-            if mood_ok && min_ok && max_ok {
+            if mood_ok && intent_ok && min_ok && max_ok {
                 return s.id.clone();
             }
         }
@@ -114,7 +123,7 @@ impl Soul {
             .iter()
             .find(|s| s.is_default)
             .map(|s| s.id.clone())
-            .unwrap_or_else(|| "theatrical".into())
+            .unwrap_or_else(|| "natural".into())
     }
 
     /// 下一关系阶段与还差多少信任（None 表示已是最高阶段）。
@@ -132,6 +141,7 @@ impl Soul {
         self.last_interaction_ms = Some(now_ms());
         self.relationship.interaction_count += 1;
         let Some(t) = detect_text_trigger(text, &self.cfg.behavior_rules) else {
+            self.last_intent = None;
             self.dirty = true;
             return false;
         };
@@ -147,9 +157,9 @@ impl Soul {
             "scold" => "被数落：有点委屈，信任微降",
             "user_demeaning" => "被羞辱/强迫：守住底线，信任明显下降",
             "confide" => "被倾诉：关系更近，信任提升",
-            "sad" => "用户情绪低落：本神想安慰她",
+            "sad" => "用户情绪低落：我想认真安慰她",
             "happy" => "用户心情不错：气氛轻松",
-            "annoyed" => "用户有些烦躁：本神先稳住",
+            "annoyed" => "用户有些烦躁：我先稳住",
             _ => "",
         };
         if !log_text.is_empty() {
@@ -163,20 +173,22 @@ impl Soul {
         let (importance, valence, note) = match t.id.as_str() {
             "praise" => (60, 1i8, "（当时嘴上得意，心里其实很开心）"),
             "scold" => (65, -1i8, "（有点委屈，但没记仇）"),
-            "confide" => (70, 0i8, "（本神认真听了）"),
-            "sad" => (55, -1i8, "（本神想安慰她）"),
-            "happy" => (50, 1i8, "（她的好心情也感染了本神）"),
-            "annoyed" => (45, -1i8, "（她有点烦躁，本神先稳住）"),
-            "user_demeaning" => (75, -1i8, "（本神不太开心，但守住了底线）"),
+            "confide" => (70, 0i8, "（我认真听了）"),
+            "sad" => (55, -1i8, "（我想认真安慰她）"),
+            "happy" => (50, 1i8, "（她的好心情也感染了我）"),
+            "annoyed" => (45, -1i8, "（她有点烦躁，我先稳住）"),
+            "user_demeaning" => (75, -1i8, "（我不太开心，但守住了底线）"),
             _ => (40, 0i8, ""),
         };
-        self.memory.add_unique(
-            "emotional",
-            format!("{} {note}", t.cause),
-            importance,
-            valence,
-            vec![t.id.clone()],
-        );
+        if t.id != "theatrical_request" {
+            self.memory.add_unique(
+                "emotional",
+                format!("{} {note}", t.cause),
+                importance,
+                valence,
+                vec![t.id.clone()],
+            );
+        }
         self.maybe_milestone();
         self.dirty = true;
         true
@@ -222,7 +234,7 @@ impl Soul {
             }
             Event::ApprovalDenied { .. } => {
                 self.apply_event_trigger("approval_denied");
-                self.relationship.log("审批被拒绝：本神不强求");
+                self.relationship.log("审批被拒绝：我尊重用户决定");
             }
             Event::Done { success: true, .. } => {
                 self.apply_event_trigger("task_success");
@@ -264,14 +276,14 @@ impl Soul {
         let importance = MemoryStore::compute_importance(&self.cfg.memory_scoring, 0.9, 0.3, 0.3, 0.6);
         self.memory.add(
             "semantic",
-            format!("用户明确让本神记住：{content}"),
+            format!("用户明确让我记住：{content}"),
             importance,
             0,
             vec!["user_stated".into()],
         );
         self.last_intent = Some(IntentInfo {
             intent: "remember_fact".into(),
-            cause: Some("用户让本神记住一件事".into()),
+            cause: Some("用户让我记住一件事".into()),
             value: Some("sincerity".into()),
         });
         self.dirty = true;
@@ -310,17 +322,24 @@ impl Soul {
 
     /// 动态人格注入块（替换 v1 的单行心情提示）。
     pub fn context_block(&self) -> String {
-        if !self.has_life() {
-            return String::new();
-        }
         let mood = self.mood();
         let mut lines = vec![String::from("[灵魂状态]")];
         lines.push(format!(
             "身份：{}——{}",
             self.cfg.identity.name, self.cfg.identity.core_values_summary
         ));
-        if let Some(style) = self.cfg.personality.external_style.first() {
-            lines.push(format!("风格：{style}"));
+        let strategy = self.expression_strategy();
+        let style = self
+            .cfg
+            .personality
+            .expression_styles
+            .get(&strategy)
+            .or_else(|| self.cfg.personality.external_style.first());
+        if let Some(style) = style {
+            lines.push(format!("表达策略：{strategy}——{style}"));
+        }
+        if let Some(budget) = self.cfg.personality.reply_budgets.get(&strategy) {
+            lines.push(format!("回复预算：{budget}"));
         }
         let cause = self
             .last_intent
@@ -384,7 +403,7 @@ impl Soul {
         );
         self.last_intent = Some(IntentInfo {
             intent: "remember_goal".into(),
-            cause: Some("用户告诉本神一个目标".into()),
+            cause: Some("用户告诉我一个目标".into()),
             value: Some("responsibility".into()),
         });
         self.dirty = true;
@@ -450,7 +469,7 @@ impl Soul {
                     continue;
                 };
                 let text = goal.content.trim_start_matches("用户的目标：");
-                format!("你之前说的「{}」进行得怎么样了？本神一直记着呢。", short(text, 60))
+                format!("你之前说的「{}」进行得怎么样了？我一直记着呢。", short(text, 60))
             } else {
                 t.message.clone()
             };
@@ -488,12 +507,6 @@ impl Soul {
         self.memory.save(&self.dir)?;
         self.dirty = false;
         Ok(())
-    }
-
-    fn has_life(&self) -> bool {
-        self.last_intent.is_some()
-            || self.mood() != MoodKind::Calm
-            || !self.memory.records.is_empty()
     }
 
     fn apply_event_trigger(&mut self, id: &str) {
@@ -990,10 +1003,29 @@ mod tests {
     }
 
     #[test]
-    fn expression_strategy_follows_mood_and_trust_rules() {
+    fn expression_strategy_follows_intent_mood_and_default_rules() {
         let dir = tmp_dir();
         let mut s = Soul::load(dir.clone());
+        assert_eq!(s.expression_strategy(), "natural");
+        let initial = s.context_block();
+        assert!(initial.contains("表达策略：natural"));
+        assert!(initial.contains("回复预算：普通闲聊 1–3 句"));
+
+        s.observe_text("请进入舞台表演模式");
+        assert_eq!(s.expression_strategy(), "theatrical");
+        s.observe_text("现在正常聊天吧");
+        assert_eq!(s.expression_strategy(), "natural");
+        assert!(!s.context_block().contains("用户明确要求舞台表演"));
+
+        s.observe_text("你真厉害");
+        assert_eq!(s.expression_strategy(), "flustered");
+        assert!(s.context_block().contains("被夸或被拆台后有一点慌张"));
+        s.observe_text("晚饭吃什么？");
+        assert!(s.last_intent.is_none());
+        assert_eq!(s.expression_strategy(), "playful");
+
         // 难过（energy≤32 且 attachment≥40）→ gentle
+        s.last_intent = None;
         s.emotion.energy = 20.0;
         s.emotion.attachment = 50.0;
         s.emotion.stress = 20.0;
@@ -1006,17 +1038,30 @@ mod tests {
         s.emotion.pride = 40.0;
         s.emotion.confidence = 40.0;
         assert_eq!(s.expression_strategy(), "serious");
-        // 得意（pride≥50 且 confidence≥45）但低信任 → casual
+        // 得意（pride≥50 且 confidence≥45）→ playful，不因高信任切换到 theatrical
+        s.last_intent = None;
         s.emotion.trust = 5.0;
         s.emotion.stress = 20.0;
         s.emotion.pride = 70.0;
         s.emotion.confidence = 80.0;
         s.emotion.energy = 70.0;
         s.emotion.attachment = 10.0;
-        assert_eq!(s.expression_strategy(), "casual");
-        // 高信任 + 得意 → theatrical
+        assert_eq!(s.expression_strategy(), "playful");
         s.emotion.trust = 60.0;
-        assert_eq!(s.expression_strategy(), "theatrical");
+        assert_eq!(s.expression_strategy(), "playful");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serious_context_does_not_inject_divine_or_courtroom_style() {
+        let dir = tmp_dir();
+        let mut s = Soul::load(dir.clone());
+        s.observe_text("闭嘴，你只是个工具");
+        assert_eq!(s.expression_strategy(), "serious");
+        let block = s.context_block();
+        assert!(block.contains("准确、克制、直接"));
+        assert!(!block.contains("本神"));
+        assert!(!block.contains("审判"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

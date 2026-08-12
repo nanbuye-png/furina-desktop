@@ -1,4 +1,4 @@
-# Furina Desktop v0.1.1 启动指南
+# Furina Desktop v0.1.2 启动指南
 
 本文只描述独立 Desktop 项目的配置、构建与启动。历史 Furina Agent CLI 不参与 Desktop 运行。
 

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { invoke } from "../lib/tauri.js";
+import { invoke, listen } from "../lib/tauri.js";
 import { VrmAvatarProvider } from "./VrmAvatarProvider.js";
 
 function normalizeArrayBuffer(payload) {
@@ -37,6 +37,13 @@ export default function AvatarStage({
   const providerRef = useRef(null);
   const [status, setStatus] = useState("loading");
   const [detail, setDetail] = useState("正在载入 Furina VRM");
+  const [revision, setRevision] = useState(0);
+
+  useEffect(() => {
+    let unlisten;
+    listen("furina-avatar-changed", () => setRevision((value) => value + 1)).then((dispose) => { unlisten = dispose; });
+    return () => unlisten?.();
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -80,7 +87,7 @@ export default function AvatarStage({
       provider?.dispose();
       providerRef.current = null;
     };
-  }, []);
+  }, [revision]);
 
   useEffect(() => {
     providerRef.current?.setState({ mood, intensity, speaking });

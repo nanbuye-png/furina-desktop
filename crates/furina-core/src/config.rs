@@ -1,10 +1,10 @@
 //! Configuration loaded from `.furina/config.yaml` (serde defaults mirror the
 //! shipped template).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     pub model: String,
@@ -22,7 +22,7 @@ pub struct Config {
     pub interject: InterjectConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LlmConfig {
     /// 旧版单提供方字段（providers 为空时回退使用）
@@ -38,7 +38,7 @@ pub struct LlmConfig {
     pub providers: Vec<ProviderConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ProviderConfig {
     pub id: String,
@@ -50,14 +50,14 @@ pub struct ProviderConfig {
     pub vision: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AgentConfig {
     pub max_repair_rounds: u32,
     pub max_steps_per_task: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ApprovalConfig {
     pub mode: String,
@@ -65,14 +65,14 @@ pub struct ApprovalConfig {
     pub danger_patterns: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct UiConfig {
     /// Desktop UI 使用该配置段保留兼容性；当前主界面由 Tauri Desktop 启动。
     pub mode: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct WebConfig {
     /// none | tavily | bing | searxng
@@ -88,7 +88,7 @@ pub struct WebConfig {
     pub fallback_endpoint: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct WebCacheConfig {
     /// 是否启用自动清理（启动会话时 + TUI 常驻每日）。
@@ -97,7 +97,7 @@ pub struct WebCacheConfig {
     pub retention_days: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct VisionConfig {
     /// 是否启用图片识别（视觉预处理代理）。
@@ -110,22 +110,25 @@ pub struct VisionConfig {
     pub allowed_formats: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct VoiceConfig {
-    /// 是否启用语音合成（fish.audio TTS）。
+    /// 是否启用语音合成。
     pub enabled: bool,
-    /// TTS 提供方：fish（需 FISH_AUDIO_API_KEY；免费模型音色不固定，自购音色包需充值）
-    /// 或 qwen（阿里百炼 qwen3.5-omni-flash 免费额度，音色固定，无需额外费用）。
+    /// 用户可见的 TTS 服务名称；请求格式由 protocol 决定。
     pub provider: String,
+    /// fish | qwen_omni | openai；空值按旧 provider 自动推导。
+    pub protocol: String,
     /// 读取 API key 的环境变量（优先 .furina/secrets.env）。
     pub api_key_env: String,
-    /// fish.audio 兼容 TTS 端点。
+    /// 完整 TTS 请求地址；qwen_omni 兼容旧配置时可回退 qwen.base_url。
     pub endpoint: String,
-    /// TTS 模型（作为请求 header `model` 传入）。免费模型：s2.1-pro-free。
+    /// TTS 模型名称。
     pub model: String,
     /// 声音模型 ID（reference_id，如鱼声平台的角色音色包）。
     pub reference_id: String,
+    /// 通用音色名称或 ID（OpenAI Speech / Qwen Omni）。
+    pub voice: String,
     /// 输出音频格式：mp3 / wav / flac。
     pub format: String,
     /// 单次合成文本上限（字符）。
@@ -136,22 +139,28 @@ pub struct VoiceConfig {
     pub auto_play: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AsrConfig {
-    /// 是否启用语音识别（fish.audio ASR，桌面版语音输入）。
+    /// 是否启用语音识别。
     pub enabled: bool,
-    /// 读取 API key 的环境变量（与 TTS 共用 FISH_AUDIO_API_KEY）。
+    /// 用户可见的 ASR 服务名称；请求格式由 protocol 决定。
+    pub provider: String,
+    /// fish | qwen_omni | openai；空值按旧 provider 自动推导。
+    pub protocol: String,
+    /// 读取 API key 的环境变量。
     pub api_key_env: String,
     /// 识别语言（ISO 码，默认 zh）。
     pub language: String,
-    /// fish.audio 兼容 ASR 端点。
+    /// 完整 ASR 请求地址；qwen_omni 兼容旧配置时可回退 qwen.base_url。
     pub endpoint: String,
-    /// ASR 提供方：fish | qwen（qwen 走 DashScope qwen3.5-omni 免费额度）。
-    pub provider: String,
+    /// ASR 模型名称。
+    pub model: String,
+    /// 可选转写提示词。
+    pub prompt: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct QwenConfig {
     /// 读取 API key 的环境变量（阿里百炼/DashScope）。
@@ -169,7 +178,7 @@ pub struct QwenConfig {
 }
 
 /// 执行关键节点的人格化插话（LLM 生成，展示层辅助）。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct InterjectConfig {
     /// 是否启用：审批通过/拒绝、任务完成/失败、验证失败时生成一句人格插话。
@@ -233,10 +242,12 @@ impl Default for VoiceConfig {
         Self {
             enabled: false,
             provider: "fish".into(),
+            protocol: String::new(),
             api_key_env: "FISH_AUDIO_API_KEY".into(),
             endpoint: "https://api.fish.audio/v1/tts".into(),
             model: "s2.1-pro-free".into(),
             reference_id: String::new(),
+            voice: String::new(),
             format: "mp3".into(),
             max_text_len: 1000,
             speed: 1.0,
@@ -249,10 +260,13 @@ impl Default for AsrConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            provider: "qwen".into(),
+            protocol: String::new(),
             api_key_env: "FISH_AUDIO_API_KEY".into(),
             language: "zh".into(),
             endpoint: "https://api.fish.audio/v1/asr".into(),
-            provider: "qwen".into(),
+            model: String::new(),
+            prompt: String::new(),
         }
     }
 }
@@ -487,6 +501,46 @@ mod tests {
         let p = cfg.active_provider().unwrap();
         assert_eq!(p.id, "deepseek");
         assert_eq!(p.base_url, "https://api.deepseek.com");
+    }
+
+    #[test]
+    fn legacy_voice_yaml_uses_defaults_for_new_fields() {
+        let cfg: Config = serde_yaml::from_str(r#"
+voice:
+  enabled: true
+  provider: fish
+  endpoint: https://api.fish.audio/v1/tts
+  model: s2.1-pro-free
+asr:
+  enabled: true
+  provider: qwen
+qwen:
+  base_url: https://dashscope.example/v1
+  asr_model: qwen-omni
+"#).unwrap();
+        assert!(cfg.voice.protocol.is_empty());
+        assert!(cfg.voice.voice.is_empty());
+        assert!(cfg.asr.protocol.is_empty());
+        assert!(cfg.asr.model.is_empty());
+        assert_eq!(cfg.qwen.asr_model, "qwen-omni");
+    }
+
+    #[test]
+    fn custom_voice_yaml_round_trips_protocol_fields() {
+        let mut cfg = Config::default();
+        cfg.voice.provider = "Local TTS".into();
+        cfg.voice.protocol = "openai".into();
+        cfg.voice.voice = "furina".into();
+        cfg.asr.provider = "Local ASR".into();
+        cfg.asr.protocol = "openai".into();
+        cfg.asr.model = "whisper-local".into();
+        cfg.asr.prompt = "专有名词".into();
+        let text = serde_yaml::to_string(&cfg).unwrap();
+        let restored: Config = serde_yaml::from_str(&text).unwrap();
+        assert_eq!(restored.voice.protocol, "openai");
+        assert_eq!(restored.voice.voice, "furina");
+        assert_eq!(restored.asr.model, "whisper-local");
+        assert_eq!(restored.asr.prompt, "专有名词");
     }
 
     #[test]

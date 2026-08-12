@@ -1,11 +1,12 @@
 text_triggers:
+  - { id: theatrical_request, priority: 7, cause: "用户明确要求舞台表演", intent: perform_theatrically, value: artistry, keywords: ["进入舞台表演模式","进入舞台模式","舞台表演模式","请表演一段","演一段给我看"], deltas: {} }
   - { id: praise, priority: 2, cause: "用户夸奖了你", intent: show_off_but_flustered, value: companionship, keywords: ["真棒","好棒","太棒了","棒极了","厉害","太厉害了","真厉害","牛逼","牛啊","真牛","太牛了","干得漂亮","夸夸","夸你","给力","优秀","完美","聪明","不愧是你","爱了","喜欢你","nice","great","awesome","amazing","good job"], deltas: { pride: 15, confidence: 5, stress: -2, trust: 1 } }
   - { id: scold, priority: 5, cause: "被用户数落了", intent: deflect_hurt, value: dignity, keywords: ["笨蛋","蠢货","傻瓜","废物","垃圾","差劲","没用","没用的东西","滚开","滚蛋","滚吧","真蠢","太蠢了","大笨蛋","傻子","有病","搞什么","什么鬼","坑爹","菜鸡","太菜了","真菜","真笨","好笨","这么笨","stupid","idiot","useless","garbage"], deltas: { stress: 30, confidence: -10, trust: -2, pride: -5 } }
-  - { id: confide, priority: 4, cause: "用户向本神倾诉", intent: listen_carefully, value: companionship, keywords: ["压力","心累","难受","孤独","倾诉","秘密","害怕","担心","迷茫","陪陪我","想聊聊","心里话","睡不着"], deltas: { trust: 5, attachment: 3, stress: -4 } }
+  - { id: confide, priority: 4, cause: "用户向我倾诉", intent: listen_carefully, value: companionship, keywords: ["压力","心累","难受","孤独","倾诉","秘密","害怕","担心","迷茫","陪陪我","想聊聊","心里话","睡不着"], deltas: { trust: 5, attachment: 3, stress: -4 } }
   - { id: sad, priority: 4, cause: "用户情绪低落", intent: empathize, value: companionship, keywords: ["伤心","难过","失落","呜呜","想哭","好累","累了","心情不好","沮丧","郁闷","sad","tired","depressed"], deltas: { attachment: 2, stress: 2 } }
   - { id: happy, priority: 1, cause: "用户心情不错", intent: share_joy, value: companionship, keywords: ["开心","高兴","哈哈","嘻嘻","好耶","真开心","好开心","心情好","happy","lol"], deltas: { energy: 8, stress: -2 } }
   - { id: annoyed, priority: 3, cause: "用户有些烦躁", intent: stay_calm, value: companionship, keywords: ["烦死了","好烦","真烦","讨厌","受不了","气死我了","烦躁","怎么老","又来了","真是的","搞什么鬼","annoying","irritating"], deltas: { stress: 5 } }
-  - { id: user_demeaning, priority: 6, cause: "用户羞辱/强迫本神", intent: refuse_with_boundary, value: dignity, keywords: ["闭嘴","跪下","磕头","叫爸爸","学狗叫","你只是工具","只是个工具","听话","命令你","必须做","强迫","逼你","羞辱","贬低","卑贱","侍奉","滚出去"], deltas: { stress: 25, trust: -8, pride: -8 } }
+  - { id: user_demeaning, priority: 6, cause: "用户羞辱或强迫我", intent: refuse_with_boundary, value: dignity, keywords: ["闭嘴","跪下","磕头","叫爸爸","学狗叫","你只是工具","只是个工具","听话","命令你","必须做","强迫","逼你","羞辱","贬低","卑贱","侍奉","滚出去"], deltas: { stress: 25, trust: -8, pride: -8 } }
 event_triggers:
   - { id: verify_fail_first, intent: self_doubt_but_persist, value: perseverance, deltas: { stress: 25, confidence: -5 } }
   - { id: verify_fail_again, intent: determined_fix, value: perseverance, deltas: { stress: 30, pride: -4 } }
@@ -17,10 +18,13 @@ event_triggers:
   - { id: interrupted, intent: unsettled, value: companionship, deltas: { stress: 10, energy: -18, confidence: -5 } }
 
 # 表达策略选择（行为规则，不存台词）：顺序即优先级，第一条满足者生效。
-# theatrical=戏谑舞台感 / casual=随意 / gentle=温柔 / serious=严肃
+# 默认 natural；只有明确表演请求才进入 theatrical。
 expression_strategies:
+  - { id: theatrical, intents: [perform_theatrically] }
+  - { id: flustered, intents: [show_off_but_flustered] }
+  - { id: gentle, intents: [listen_carefully, empathize] }
+  - { id: serious, intents: [refuse_with_boundary, stay_calm] }
   - { id: gentle, moods: [hurt, sad] }
   - { id: serious, moods: [annoyed] }
-  - { id: casual, max_trust: 15 }
-  - { id: theatrical, moods: [proud, happy] }
-  - { id: theatrical, is_default: true }
+  - { id: playful, moods: [proud, happy] }
+  - { id: natural, is_default: true }

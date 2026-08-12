@@ -4,7 +4,7 @@
 use furina_core::agent::{Agent, Approver, PromptContextProvider};
 use furina_core::config::{Config, ProviderConfig};
 use furina_core::llm::{FixtureLlm, LlmClient, LlmResponse};
-use furina_core::sidecar::{EventSink, Sidecar};
+use furina_core::sidecar::{EventSink, Sidecar, SidecarLaunch};
 use furina_core::web_cache::WebCache;
 use furina_proto::{ChatMessage, Event, ToolCall, ToolFunctionCall, ToolSpec};
 use async_trait::async_trait;
@@ -189,8 +189,10 @@ fn temp_fixture_ws() -> PathBuf {
 async fn spawn_sidecar(ws: &Path, sink: Arc<dyn EventSink>) -> Sidecar {
     let root = repo_root();
     Sidecar::spawn(
-        "python",
-        &root.join("python").display().to_string(),
+        &SidecarLaunch::Python {
+            executable: "python".into(),
+            python_path: root.join("python"),
+        },
         &ws.display().to_string(),
         sink,
     )
@@ -735,7 +737,7 @@ async fn provider_switch_keeps_prompt_identical() {
     if !python_available() {
         return;
     }
-    let base = Config::load(&repo_root().join(".furina/config.yaml")).unwrap();
+    let base = Config::load(&repo_root().join("desktop/resources/defaults/config.yaml")).unwrap();
 
     let mut cfg_a = base.clone();
     cfg_a.llm.providers = vec![ProviderConfig {

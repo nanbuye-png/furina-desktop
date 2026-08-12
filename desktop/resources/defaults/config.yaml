@@ -1,0 +1,32 @@
+model: deepseek-chat
+llm:
+  base_url: https://api.deepseek.com
+  api_key_env: FURINA_API_KEY
+  temperature: 0.7
+  max_total_tokens: 16000
+  per_request_max_tokens: 4096
+  tool_output_truncate: 12000
+  active_provider: deepseek
+  providers:
+    - id: deepseek
+      label: DeepSeek
+      base_url: https://api.deepseek.com
+      api_key_env: FURINA_API_KEY
+      model: deepseek-chat
+      vision: false
+persona: furina
+approval:
+  mode: confirm
+ui:
+  mode: chat
+web:
+  search_backend: none
+web_cache:
+  enabled: true
+  retention_days: 7
+voice:
+  enabled: false
+asr:
+  enabled: false
+interject:
+  enabled: true

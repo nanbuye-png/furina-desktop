@@ -11,9 +11,8 @@ build/
 *.log
 .DS_Store
 .e2e/
-.furina/memory/
-.furina/web_cache/
-.furina/voice/
-.furina/avatar/
+.furina/*
+!.furina/secrets.env.example
 .cargo/config.toml
-.furina/secrets.env
+
+/desktop/src-tauri/bin/*.exe

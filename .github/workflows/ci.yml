@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: desktop/ui/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Frontend dependencies
+        working-directory: desktop/ui
+        run: npm ci
+      - name: Frontend tests
+        working-directory: desktop/ui
+        run: npm test
+      - name: Frontend build
+        working-directory: desktop/ui
+        run: npm run build
+      - name: Python tests
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = "python"
+          python -m unittest discover -s python/furina_tools/tests -v
+      - name: Build packaged sidecar
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check pyinstaller
+          ./scripts/build-sidecar.ps1
+      - name: Packaged sidecar smoke test
+        run: python scripts/sidecar-smoke.py desktop/src-tauri/bin/furina-sidecar.exe
+      - name: Rust tests
+        run: cargo test --workspace
+      - name: RC tooling self-test
+        shell: pwsh
+        run: ./scripts/rc/Test-RcTooling.ps1
+      - name: Reject private runtime assets
+        shell: pwsh
+        run: |
+          $tracked = git ls-files
+          $forbidden = $tracked | Select-String -Pattern '(^|/)(secrets\.env$|Furina\.vrm$|memory/|voice/|web_cache/)'
+          if ($forbidden) { $forbidden; throw "检测到不应提交的用户数据或资产" }

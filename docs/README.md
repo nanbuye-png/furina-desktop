@@ -5,18 +5,22 @@
 ## 推荐阅读顺序
 
 1. [STARTUP_GUIDE.md](STARTUP_GUIDE.md) — 安装、密钥、构建、启动和故障排查。
-2. [FURINA_DESKTOP_UI_SPEC_V1.md](FURINA_DESKTOP_UI_SPEC_V1.md) — Desktop 架构与协议边界。
-3. [FURINA_PROJECT_FREEZE_REPORT.md](FURINA_PROJECT_FREEZE_REPORT.md) — 稳定接口与允许演进范围。
-4. [FURINA_SOUL_ROADMAP.md](FURINA_SOUL_ROADMAP.md) — 人格、情绪、关系、记忆与主动行为路线。
-5. [VOICE_RESEARCH.md](VOICE_RESEARCH.md) — ASR/TTS 技术决策与已验证链路。
-6. [FURINA_3D_AVATAR_ROADMAP.md](FURINA_3D_AVATAR_ROADMAP.md) — VRM Avatar 长期路线。
-7. [FURINA_AVATAR_ASSET_SPEC_V1.md](FURINA_AVATAR_ASSET_SPEC_V1.md) — 模型制作和验收规范。
+2. [PERSONA_V2_ACCEPTANCE.md](PERSONA_V2_ACCEPTANCE.md) — v0.1.3 人格、现实边界和短回复验收。
+3. [RC_ACCEPTANCE_TEST_0.1.2.md](RC_ACCEPTANCE_TEST_0.1.2.md) — v0.1.2 Windows Sandbox 验收历史基线。
+4. [FURINA_DESKTOP_UI_SPEC_V1.md](FURINA_DESKTOP_UI_SPEC_V1.md) — Desktop 架构与协议边界。
+4. [FURINA_PROJECT_FREEZE_REPORT.md](FURINA_PROJECT_FREEZE_REPORT.md) — 稳定接口与允许演进范围。
+5. [FURINA_SOUL_ROADMAP.md](FURINA_SOUL_ROADMAP.md) — 人格、情绪、关系、记忆与主动行为路线。
+6. [VOICE_RESEARCH.md](VOICE_RESEARCH.md) — ASR/TTS 技术决策与已验证链路。
+7. [FURINA_3D_AVATAR_ROADMAP.md](FURINA_3D_AVATAR_ROADMAP.md) — VRM Avatar 长期路线。
+8. [FURINA_AVATAR_ASSET_SPEC_V1.md](FURINA_AVATAR_ASSET_SPEC_V1.md) — 模型制作和验收规范。
 
 ## 文档状态
 
 | 文档 | 类型 | 状态 |
 | --- | --- | --- |
 | STARTUP_GUIDE | 操作指南 | 随当前版本维护 |
+| PERSONA_V2_ACCEPTANCE | 人格验收 | v0.1.3 开发中 |
+| RC_ACCEPTANCE_TEST_0.1.2 | RC 验收 | v0.1.2 历史基线 |
 | FURINA_DESKTOP_UI_SPEC_V1 | 架构规范 | v1 冻结 |
 | FURINA_PROJECT_FREEZE_REPORT | 架构边界 | 随基线更新 |
 | FURINA_SOUL_ROADMAP | 长期路线 | 持续演进 |

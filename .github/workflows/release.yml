@@ -1,0 +1,80 @@
+name: Desktop Release
+
+on:
+  push:
+    tags:
+      - "desktop-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: desktop/ui/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install frontend dependencies
+        working-directory: desktop/ui
+        run: npm ci
+      - name: Validate frontend
+        working-directory: desktop/ui
+        run: |
+          npm test
+          npm run build
+      - name: Validate Python
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = "python"
+          python -m unittest discover -s python/furina_tools/tests -v
+      - name: Build sidecar
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check pyinstaller
+          ./scripts/build-sidecar.ps1
+          python scripts/sidecar-smoke.py desktop/src-tauri/bin/furina-sidecar.exe
+      - name: Validate Rust
+        run: cargo test --workspace --target x86_64-pc-windows-msvc
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0" --locked
+      - name: Prepare verified NSIS toolchain
+        shell: pwsh
+        run: ./scripts/prepare-tauri-nsis.ps1
+      - name: Build NSIS installer
+        run: cargo tauri build --target x86_64-pc-windows-msvc
+      - name: Assemble release files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $installer = Get-ChildItem target/x86_64-pc-windows-msvc/release/bundle/nsis -Filter *.exe | Select-Object -First 1
+          if (-not $installer) { throw "未生成 NSIS 安装器" }
+          Copy-Item $installer.FullName dist/Furina-Desktop-0.1.2-x64-Setup.exe
+          ./scripts/build-portable.ps1 -ExecutablePath target/x86_64-pc-windows-msvc/release/furina-desktop.exe
+          Get-FileHash dist/Furina-Desktop-0.1.2-x64-Setup.exe, dist/Furina-Desktop-0.1.2-x64-Portable.zip -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLowerInvariant(), (Split-Path $_.Path -Leaf) } |
+            Set-Content -Encoding ascii dist/SHA256SUMS.txt
+      - name: Verify release artifacts
+        shell: pwsh
+        run: |
+          ./scripts/rc/Test-RcArtifacts.ps1
+          ./scripts/rc/Test-RcTooling.ps1
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Furina Desktop v0.1.2
+          body_path: docs/RELEASE_NOTES_0.1.2.md
+          prerelease: true
+          files: |
+            dist/Furina-Desktop-0.1.2-x64-Setup.exe
+            dist/Furina-Desktop-0.1.2-x64-Portable.zip
+            dist/SHA256SUMS.txt

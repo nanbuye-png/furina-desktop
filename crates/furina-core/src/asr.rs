@@ -19,6 +19,7 @@ use std::time::Duration;
 pub struct AsrClient {
     client: reqwest::Client,
     kind: AsrKind,
+    provider: String,
     language: String,
 }
 
@@ -26,6 +27,7 @@ pub struct AsrClient {
 enum AsrKind {
     Fish { api_key: String, endpoint: String },
     Qwen { api_key: String, base_url: String, model: String, prompt: String },
+    OpenAi { api_key: String, endpoint: String, model: String, prompt: String },
 }
 
 impl AsrClient {
@@ -34,41 +36,61 @@ impl AsrClient {
         if !cfg.asr.enabled {
             anyhow::bail!("语音识别未启用（config.yaml 中 asr.enabled: true 后可启用）");
         }
-        let provider = cfg.asr.provider.trim().to_lowercase();
-        let language = {
-            let l = cfg.asr.language.trim().to_string();
-            if l.is_empty() { "zh".into() } else { l }
-        };
+        let provider = cfg.asr.provider.trim().to_string();
+        let protocol = asr_protocol(cfg);
+        let language = value_or(&cfg.asr.language, "zh");
         let client = apply_system_proxy(
             reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
                 .timeout(Duration::from_secs(90)),
         )
         .build()?;
-        let kind = match provider.as_str() {
-            "qwen" => {
-                let api_key = env_key(&cfg.qwen.api_key_env, "QWEN_API_KEY")?;
-                let model = {
-                    let m = cfg.qwen.asr_model.trim().to_string();
-                    if m.is_empty() { "qwen3.5-omni-flash".into() } else { m }
+        let kind = match protocol.as_str() {
+            "qwen_omni" => {
+                let legacy = cfg.asr.protocol.trim().is_empty();
+                let api_key_env = if legacy { &cfg.qwen.api_key_env } else { &cfg.asr.api_key_env };
+                let api_key = env_key(api_key_env, "QWEN_API_KEY")?;
+                let endpoint = if legacy {
+                    required(&cfg.qwen.base_url, "Qwen API 地址")?
+                } else {
+                    required_or(&cfg.asr.endpoint, &cfg.qwen.base_url, "Qwen API 地址")?
                 };
-                AsrKind::Qwen {
-                    api_key,
-                    base_url: cfg.qwen.base_url.trim_end_matches('/').to_string(),
-                    model,
-                    prompt: cfg.qwen.asr_prompt.trim().to_string(),
-                }
+                let model = if legacy {
+                    required_or(&cfg.qwen.asr_model, "qwen3.5-omni-flash", "ASR 模型")?
+                } else {
+                    required_or(&cfg.asr.model, &cfg.qwen.asr_model, "ASR 模型")?
+                };
+                let prompt = if legacy && cfg.asr.prompt.trim().is_empty() {
+                    cfg.qwen.asr_prompt.trim().to_string()
+                } else {
+                    cfg.asr.prompt.trim().to_string()
+                };
+                AsrKind::Qwen { api_key, base_url: endpoint, model, prompt }
             }
             "fish" => {
                 let api_key = env_key(&cfg.asr.api_key_env, "FISH_AUDIO_API_KEY")?;
                 AsrKind::Fish {
                     api_key,
-                    endpoint: cfg.asr.endpoint.trim_end_matches('/').to_string(),
+                    endpoint: required(&cfg.asr.endpoint, "ASR API 地址")?,
                 }
             }
-            other => anyhow::bail!("未知 ASR provider: {other}（支持 qwen / fish）"),
+            "openai" => {
+                let api_key = env_key(&cfg.asr.api_key_env, "FURINA_ASR_API_KEY")?;
+                AsrKind::OpenAi {
+                    api_key,
+                    endpoint: required(&cfg.asr.endpoint, "ASR API 地址")?,
+                    model: required(&cfg.asr.model, "ASR 模型")?,
+                    prompt: cfg.asr.prompt.trim().to_string(),
+                }
+            }
+            other => anyhow::bail!("未知 ASR protocol: {other}（支持 fish / qwen_omni / openai）"),
         };
-        Ok(Self { client, kind, language })
+        Ok(Self {
+            client,
+            kind,
+            provider: if provider.is_empty() { protocol } else { provider },
+            language,
+        })
     }
 
     pub fn language(&self) -> &str {
@@ -77,10 +99,7 @@ impl AsrClient {
 
     /// 当前识别后端名（qwen / fish），用于展示与诊断。
     pub fn provider(&self) -> &str {
-        match self.kind {
-            AsrKind::Fish { .. } => "fish",
-            AsrKind::Qwen { .. } => "qwen",
-        }
+        &self.provider
     }
 
     /// 识别一段音频为文本。`mime` 用于 fish 后端文件名后缀；
@@ -97,6 +116,9 @@ impl AsrClient {
                 self.transcribe_qwen(audio, mime, api_key, base_url, model, prompt)
                     .await
             }
+            AsrKind::OpenAi { api_key, endpoint, model, prompt } => {
+                self.transcribe_openai(audio, mime, api_key, endpoint, model, prompt).await
+            }
         }
     }
 
@@ -108,16 +130,7 @@ impl AsrClient {
         api_key: &str,
         endpoint: &str,
     ) -> anyhow::Result<String> {
-        let ext = match mime {
-            "audio/wav" | "audio/x-wav" => "wav",
-            "audio/mp4" | "audio/m4a" => "m4a",
-            "audio/ogg" => "ogg",
-            _ => "webm",
-        };
-        let file = Part::bytes(audio)
-            .file_name(format!("furina_input.{ext}"))
-            .mime_str(mime)
-            .map_err(|e| anyhow::anyhow!("音频 MIME 无效: {e}"))?;
+        let file = audio_part(audio, mime)?;
         let form = Form::new()
             .part("audio", file)
             .text("language", self.language.clone());
@@ -133,16 +146,30 @@ impl AsrClient {
         if !status.is_success() {
             anyhow::bail!("语音识别 API 错误 {status}: {}", short(&text));
         }
-        let v: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|_| anyhow::anyhow!("语音识别响应不是有效 JSON"))?;
-        let out = v["text"]
-            .as_str()
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
-        if out.is_empty() {
-            anyhow::bail!("语音识别返回空文本");
+        parse_transcription_text(&text, "语音识别")
+    }
+
+    /// OpenAI-compatible Audio Transcriptions：multipart 音频转写。
+    async fn transcribe_openai(
+        &self,
+        audio: Vec<u8>,
+        mime: &str,
+        api_key: &str,
+        endpoint: &str,
+        model: &str,
+        prompt: &str,
+    ) -> anyhow::Result<String> {
+        let file = audio_part(audio, mime)?;
+        let mut form = Form::new().part("file", file).text("model", model.to_string());
+        if !self.language.trim().is_empty() { form = form.text("language", self.language.clone()); }
+        if !prompt.trim().is_empty() { form = form.text("prompt", prompt.trim().to_string()); }
+        let resp = self.client.post(endpoint).bearer_auth(api_key).multipart(form).send().await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("ASR API 错误 {status}: {}", short(&text));
         }
-        Ok(out)
+        parse_transcription_text(&text, "ASR")
     }
 
     /// Qwen-Omni（DashScope OpenAI 兼容接口）：`input_audio` base64 → 转写文本。
@@ -206,6 +233,62 @@ impl AsrClient {
     }
 }
 
+fn asr_protocol(cfg: &Config) -> String {
+    let explicit = cfg.asr.protocol.trim().to_lowercase();
+    if !explicit.is_empty() {
+        return match explicit.as_str() {
+            "fish_asr" => "fish".into(),
+            "qwen" | "openai_chat_audio" => "qwen_omni".into(),
+            "openai_transcriptions" => "openai".into(),
+            _ => explicit,
+        };
+    }
+    match cfg.asr.provider.trim().to_lowercase().as_str() {
+        "fish" => "fish".into(),
+        "qwen" => "qwen_omni".into(),
+        _ => "openai".into(),
+    }
+}
+
+fn required(value: &str, label: &str) -> anyhow::Result<String> {
+    let value = value.trim();
+    if value.is_empty() { anyhow::bail!("{label}不能为空"); }
+    Ok(value.trim_end_matches('/').to_string())
+}
+
+fn required_or(value: &str, fallback: &str, label: &str) -> anyhow::Result<String> {
+    let selected = if value.trim().is_empty() { fallback } else { value };
+    required(selected, label)
+}
+
+fn value_or(value: &str, fallback: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() { fallback.into() } else { value.into() }
+}
+
+fn audio_part(audio: Vec<u8>, mime: &str) -> anyhow::Result<Part> {
+    let ext = match mime {
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/mp4" | "audio/m4a" => "m4a",
+        "audio/ogg" => "ogg",
+        "audio/flac" => "flac",
+        _ => "webm",
+    };
+    Part::bytes(audio)
+        .file_name(format!("furina_input.{ext}"))
+        .mime_str(mime)
+        .map_err(|error| anyhow::anyhow!("音频 MIME 无效: {error}"))
+}
+
+fn parse_transcription_text(text: &str, label: &str) -> anyhow::Result<String> {
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|_| anyhow::anyhow!("{label}响应不是有效 JSON"))?;
+    let output = value["text"].as_str().unwrap_or_default().trim();
+    if output.is_empty() { anyhow::bail!("{label}返回空文本"); }
+    Ok(output.to_string())
+}
+
 fn env_key(var: &str, fallback: &str) -> anyhow::Result<String> {
     let name = {
         let v = var.trim();
@@ -267,11 +350,21 @@ mod tests {
                 let addr = listener.local_addr().unwrap();
                 tx.send(addr.to_string()).unwrap();
                 let (mut sock, _) = listener.accept().await.unwrap();
-                let mut buf = [0u8; 256 * 1024];
-                let n = sock.read(&mut buf).await.unwrap();
-                if let Ok(s) = std::str::from_utf8(&buf[..n]) {
-                    *cap.lock().unwrap() = s.to_string();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 16 * 1024];
+                loop {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    if n == 0 { break; }
+                    request.extend_from_slice(&buf[..n]);
+                    let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else { continue; };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().ok()).flatten()
+                    }).unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length { break; }
                 }
+                *cap.lock().unwrap() = String::from_utf8_lossy(&request).to_string();
                 let reason = if status == 200 { "OK" } else { "Error" };
                 let resp = format!(
                     "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
@@ -323,19 +416,40 @@ mod tests {
     }
 
     #[test]
-    fn unknown_provider_rejected() {
+    fn unknown_protocol_rejected() {
         let mut cfg = Config::default();
         cfg.asr.enabled = true;
-        cfg.asr.provider = "nonexistent".into();
-        cfg.qwen.api_key_env = "FURINA_TEST_QWEN_KEY_UNKNOWN".into();
-        unsafe {
-            std::env::set_var("FURINA_TEST_QWEN_KEY_UNKNOWN", "qk");
-        }
+        cfg.asr.provider = "Custom Service".into();
+        cfg.asr.protocol = "nope".into();
         let err = AsrClient::from_config(&cfg).unwrap_err().to_string();
-        assert!(err.contains("未知 ASR provider"), "{err}");
-        unsafe {
-            std::env::remove_var("FURINA_TEST_QWEN_KEY_UNKNOWN");
-        }
+        assert!(err.contains("未知 ASR protocol"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn openai_transcriptions_uses_independent_configuration() {
+        let (addr, captured) = spawn_asr_mock(200, r#"{"text":"识别成功"}"#.into());
+        let mut cfg = Config::default();
+        cfg.asr.enabled = true;
+        cfg.asr.provider = "My ASR".into();
+        cfg.asr.protocol = "openai".into();
+        cfg.asr.endpoint = format!("http://{addr}/v1/audio/transcriptions");
+        cfg.asr.model = "whisper-custom".into();
+        cfg.asr.prompt = "专有名词：芙宁娜".into();
+        cfg.asr.language = "zh".into();
+        cfg.asr.api_key_env = "FURINA_TEST_OPENAI_ASR_KEY".into();
+        unsafe { std::env::set_var("FURINA_TEST_OPENAI_ASR_KEY", "asr-key"); }
+        let client = AsrClient::from_config(&cfg).unwrap();
+        assert_eq!(client.provider(), "My ASR");
+        let text = client.transcribe(b"fake-mp3".to_vec(), "audio/mpeg").await.unwrap();
+        assert_eq!(text, "识别成功");
+        let request = captured.lock().unwrap().clone();
+        assert!(request.contains("/v1/audio/transcriptions"), "{request}");
+        assert!(request.contains("name=\"file\""), "{request}");
+        assert!(request.contains("furina_input.mp3"), "{request}");
+        assert!(request.contains("whisper-custom"), "{request}");
+        assert!(request.contains("专有名词：芙宁娜"), "{request}");
+        assert!(request.to_lowercase().contains("bearer asr-key"), "{request}");
+        unsafe { std::env::remove_var("FURINA_TEST_OPENAI_ASR_KEY"); }
     }
 
     #[tokio::test]

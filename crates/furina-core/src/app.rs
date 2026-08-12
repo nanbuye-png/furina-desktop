@@ -6,7 +6,7 @@
 use crate::agent::{Agent, Approver, PromptContextProvider};
 use crate::config::Config;
 use crate::llm::{DeepSeekClient, LlmClient};
-use crate::sidecar::{EventSink, Sidecar};
+use crate::sidecar::{EventSink, Sidecar, SidecarLaunch};
 use crate::web_cache::WebCache;
 use furina_proto::Event;
 use furina_soul::Soul;
@@ -15,6 +15,23 @@ use std::env;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+#[derive(Clone, Debug)]
+pub struct RuntimePaths {
+    pub resource_root: PathBuf,
+    pub data_root: PathBuf,
+    pub workspace_root: PathBuf,
+    pub sidecar: SidecarLaunch,
+}
+
+impl RuntimePaths {
+    pub fn config_path(&self) -> PathBuf { self.data_root.join(".furina/config.yaml") }
+    pub fn secrets_path(&self) -> PathBuf { self.data_root.join(".furina/secrets.env") }
+    pub fn soul_dir(&self) -> PathBuf { self.data_root.join(".furina/memory") }
+    pub fn voice_dir(&self) -> PathBuf { self.data_root.join(".furina/voice") }
+    pub fn web_cache_dir(&self) -> PathBuf { self.data_root.join(".furina/web_cache") }
+    pub fn avatar_dir(&self) -> PathBuf { self.data_root.join(".furina/avatar") }
+}
 
 pub fn soul_dir(root: &Path) -> PathBuf {
     root.join(".furina/memory")
@@ -78,19 +95,27 @@ pub fn parse_secrets_text(text: &str) -> Vec<(String, String)> {
 
 /// 启动时读取 `.furina/secrets.env` 并注入环境（已存在的环境变量不覆盖）。
 pub fn load_secrets_env(root: &Path) {
+    load_secrets_env_with(root, false);
+}
+
+pub fn reload_secrets_env(root: &Path) {
+    load_secrets_env_with(root, true);
+}
+
+fn load_secrets_env_with(root: &Path, overwrite: bool) {
     let path = root.join(".furina/secrets.env");
     let Ok(text) = std::fs::read_to_string(&path) else {
         return;
     };
-    for (k, v) in parse_secrets_text(&text) {
-        if env::var_os(&k).is_none() {
-            let _ = env::set_var(k, v);
+    for (key, value) in parse_secrets_text(&text) {
+        if overwrite || env::var_os(&key).is_none() {
+            let _ = env::set_var(key, value);
         }
     }
 }
 
 pub fn find_repo_root() -> Option<PathBuf> {
-    if let Ok(root) = env::var("FURINA_AGENT_ROOT") {
+    if let Ok(root) = env::var("FURINA_DESKTOP_ROOT").or_else(|_| env::var("FURINA_AGENT_ROOT")) {
         let p = PathBuf::from(root);
         if is_repo_root(&p) {
             return Some(p);
@@ -124,9 +149,6 @@ pub fn find_python() -> String {
     env::var("FURINA_PYTHON").unwrap_or_else(|_| "python".to_string())
 }
 
-pub fn python_dir(root: &Path) -> String {
-    root.join("python").display().to_string()
-}
 
 /// 按提供方配置构造 OpenAI 兼容客户端（key 从环境变量读取）。
 pub fn build_llm(cfg: &Config) -> anyhow::Result<Box<dyn LlmClient>> {
@@ -151,6 +173,8 @@ pub fn build_llm(cfg: &Config) -> anyhow::Result<Box<dyn LlmClient>> {
 #[derive(Deserialize)]
 struct PersonaMeta {
     #[serde(default)]
+    persona_version: u32,
+    #[serde(default)]
     dialogue_style: String,
 }
 
@@ -158,6 +182,9 @@ struct PersonaMeta {
 pub fn build_system_prompt(root: &Path, persona: &str) -> anyhow::Result<String> {
     let persona_path = root.join("persona").join(format!("{persona}.yaml"));
     let meta: PersonaMeta = serde_yaml::from_str(&std::fs::read_to_string(&persona_path)?)?;
+    if meta.persona_version >= 2 && meta.dialogue_style.trim().is_empty() {
+        anyhow::bail!("persona v2 缺少 dialogue_style：{}", persona_path.display());
+    }
     let prompt = std::fs::read_to_string(root.join("persona/system_prompt.md"))?;
     Ok(prompt.replace("{persona_style}", &meta.dialogue_style))
 }
@@ -181,26 +208,24 @@ impl PromptContextProvider for SoulProvider {
 
 /// 组装一个完整 Agent（LLM + 侧车 + 人格注入 + 网页缓存）。
 pub async fn build_agent(
-    root: &Path,
-    ws: &Path,
+    paths: &RuntimePaths,
     persona: &str,
     soul: Arc<Mutex<Soul>>,
     sink: Arc<dyn EventSink>,
     approver: Box<dyn Approver>,
 ) -> anyhow::Result<Agent> {
-    let cfg = Config::load(&root.join(".furina/config.yaml"))?;
-    let system_prompt = build_system_prompt(root, persona)?;
+    let cfg = Config::load(&paths.config_path())?;
+    let system_prompt = build_system_prompt(&paths.resource_root, persona)?;
     let llm = build_llm(&cfg)?;
     let sidecar = Sidecar::spawn(
-        &find_python(),
-        &python_dir(root),
-        &ws.display().to_string(),
+        &paths.sidecar,
+        &paths.workspace_root.display().to_string(),
         sink.clone(),
     )
     .await?;
     let mut agent = Agent::new(
         cfg,
-        ws.to_path_buf(),
+        paths.workspace_root.clone(),
         sidecar,
         llm,
         sink,
@@ -208,9 +233,9 @@ pub async fn build_agent(
         system_prompt,
     );
     // Soul 私有边界：人格配置 / 记忆 / 密钥目录对 LLM 工具不可读写。
-    agent.set_private_paths(vec![root.join("persona"), root.join(".furina")]);
+    agent.set_private_paths(vec![paths.resource_root.join("persona"), paths.data_root.join(".furina")]);
     agent.set_prompt_context(Box::new(SoulProvider(soul)));
-    agent.set_web_cache(WebCache::open(&root.join(".furina/web_cache")));
+    agent.set_web_cache(WebCache::open(&paths.web_cache_dir()));
     Ok(agent)
 }
 
@@ -238,5 +263,19 @@ mod tests {
         assert_eq!(map.get("QUOTED").map(String::as_str), Some("a # b"));
         assert_eq!(map.get("HASH").map(String::as_str), Some("abc#def"));
         assert_eq!(map.get("E").map(String::as_str), Some("xyz"));
+    }
+
+    #[test]
+    fn persona_v2_prompt_contains_reality_and_length_rules() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text = std::fs::read_to_string(root.join("persona/furina.yaml")).unwrap();
+        let meta: PersonaMeta = serde_yaml::from_str(&text).unwrap();
+        assert_eq!(meta.persona_version, 2);
+
+        let prompt = build_system_prompt(&root, "furina").unwrap();
+        assert!(prompt.contains("当前环境是现实世界，不是提瓦特"));
+        assert!(prompt.contains("普通闲聊默认 1–3 句"));
+        assert!(prompt.contains("不得声称看见用户、桌面物品或房间"));
+        assert!(!prompt.contains("喜欢把对话当演出"));
     }
 }
