@@ -4,13 +4,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "python"))
 
 from furina_tools.tools import (  # noqa: E402
-    ToolError, create_file, diff_file, file_hash, read_file, resolve_path, run_command,
-    search, write_file,
+    ToolError, _relative_to_workspace, create_file, diff_file, file_hash, read_file,
+    resolve_path, run_command, search, write_file,
 )
 
 
@@ -83,6 +84,16 @@ class FsToolTest(unittest.TestCase):
         matches = search(self.ws, {"pattern": r"line\s+two", "regex": True})["matches"]
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0]["line_number"], 2)
+
+    def test_relative_path_falls_back_to_samefile_parent_match(self):
+        file_path = self.ws / "hello.txt"
+        with mock.patch.object(
+            Path,
+            "relative_to",
+            side_effect=ValueError("simulated Windows 8.3 alias mismatch"),
+        ):
+            relative = _relative_to_workspace(file_path, self.ws)
+        self.assertEqual(relative.as_posix(), "hello.txt")
 
     def test_diff(self):
         d = diff_file(self.ws, {"path": "hello.txt", "content": "hello world!\nline two\n"})

@@ -1,6 +1,7 @@
 """Tool implementations: filesystem, search, diff, terminal. Stdlib only."""
 
 import difflib
+import os
 import subprocess
 import threading
 from pathlib import Path
@@ -19,6 +20,26 @@ class ToolError(Exception):
         self.code = code
 
 
+def _relative_to_workspace(path, workspace):
+    """Return a relative path even when Windows mixes 8.3 and long names."""
+    path = Path(path).resolve()
+    workspace = Path(workspace).resolve()
+    try:
+        return path.relative_to(workspace)
+    except ValueError as error:
+        current = path
+        parts = []
+        while current != current.parent:
+            try:
+                if os.path.samefile(current, workspace):
+                    return Path(*reversed(parts))
+            except OSError:
+                pass
+            parts.append(current.name)
+            current = current.parent
+        raise error
+
+
 def resolve_path(workspace, rel, allow_escape=False):
     """Resolve a path against the workspace root; reject escapes unless allowed."""
     workspace = Path(workspace).resolve()
@@ -28,7 +49,7 @@ def resolve_path(workspace, rel, allow_escape=False):
     p = p.resolve()
     if not allow_escape:
         try:
-            p.relative_to(workspace)
+            _relative_to_workspace(p, workspace)
         except ValueError:
             raise ToolError(f"path escapes workspace: {rel}", -32001)
     return p
@@ -88,7 +109,7 @@ def search(ws, params, allow_escape=False):
                     for lineno, line in enumerate(f, 1):
                         hit = matcher.search(line) if use_regex else (pattern.lower() in line.lower())
                         if hit:
-                            rel = str(fpath.relative_to(ws)).replace("\\", "/")
+                            rel = str(_relative_to_workspace(fpath, ws)).replace("\\", "/")
                             matches.append({"path": rel, "line_number": lineno, "line": line.rstrip()[:500]})
                             break
             except (OSError, UnicodeError):
