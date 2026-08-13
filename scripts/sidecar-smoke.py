@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 
 
@@ -15,6 +16,12 @@ def exchange(process, payload):
         stderr = process.stderr.read()
         raise RuntimeError(f"sidecar exited without a response: {stderr}")
     return json.loads(line)
+
+
+def expected_version():
+    project_file = Path(__file__).resolve().parent.parent / "python" / "pyproject.toml"
+    with project_file.open("rb") as stream:
+        return tomllib.load(stream)["project"]["version"]
 
 
 def main():
@@ -30,7 +37,7 @@ def main():
         )
         try:
             initialized = exchange(process, {"id": 1, "method": "initialize", "params": {"workspace_root": str(Path(workspace))}})
-            if initialized.get("result", {}).get("version") != "0.1.2":
+            if initialized.get("result", {}).get("version") != expected_version():
                 raise RuntimeError(f"unexpected initialize response: {initialized}")
             tools = exchange(process, {"id": 2, "method": "tools.list", "params": {}})
             names = {item.get("name") for item in tools.get("result", {}).get("tools", [])}
