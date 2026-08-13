@@ -20,6 +20,7 @@ pub struct Config {
     pub asr: AsrConfig,
     pub qwen: QwenConfig,
     pub interject: InterjectConfig,
+    pub emotion_classifier: EmotionClassifierConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -191,6 +192,16 @@ pub struct InterjectConfig {
     pub max_chars: usize,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct EmotionClassifierConfig {
+    pub enabled: bool,
+    pub provider_id: String,
+    pub model: String,
+    pub timeout_ms: u64,
+    pub max_tokens: usize,
+}
+
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
@@ -295,6 +306,18 @@ impl Default for InterjectConfig {
     }
 }
 
+impl Default for EmotionClassifierConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider_id: String::new(),
+            model: String::new(),
+            timeout_ms: 1500,
+            max_tokens: 256,
+        }
+    }
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self { max_repair_rounds: 3, max_steps_per_task: 50 }
@@ -379,6 +402,7 @@ impl Default for Config {
             asr: AsrConfig::default(),
             qwen: QwenConfig::default(),
             interject: InterjectConfig::default(),
+            emotion_classifier: EmotionClassifierConfig::default(),
         }
     }
 }

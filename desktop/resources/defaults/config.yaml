@@ -30,3 +30,9 @@ asr:
   enabled: false
 interject:
   enabled: true
+emotion_classifier:
+  enabled: false
+  provider_id: ""
+  model: ""
+  timeout_ms: 1500
+  max_tokens: 256

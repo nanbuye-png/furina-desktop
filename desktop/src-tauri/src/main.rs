@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use furina_core::agent::{Agent, Approver};
 use furina_core::app::{self, InstanceLock, RuntimePaths};
 use furina_core::asr::AsrClient;
-use furina_core::config::{Config, ProviderConfig};
+use furina_core::config::{Config, EmotionClassifierConfig, ProviderConfig};
 use furina_core::interject::{InterjectCtx, Interjector};
 use furina_core::sidecar::{EventSink, Sidecar};
 use furina_core::voice::VoiceClient;
@@ -264,7 +264,7 @@ async fn get_soul_state(state: State<'_, AppState>) -> Result<serde_json::Value,
     let emotions = &soul.emotion;
     let root_name = paths.workspace_root.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_else(|| "workspace".into());
     Ok(serde_json::json!({
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "timestamp": furina_soul::now_ms(),
         "workspace": {
             "root": paths.data_root.display().to_string(),
@@ -275,6 +275,16 @@ async fn get_soul_state(state: State<'_, AppState>) -> Result<serde_json::Value,
         "mood": mood.as_str(),
         "mood_label": mood.label(),
         "intensity": mood_intensity(mood.as_str(), emotions),
+        "affect": {
+            "primary": soul.affect.primary,
+            "secondary": soul.affect.secondary,
+            "intensity": soul.affect.intensity,
+            "trend": soul.affect.trend,
+            "recoverAfter": soul.affect.recover_after,
+            "conflictLevel": soul.affect.conflict_level,
+            "unresolved": soul.affect.unresolved,
+            "repairProgress": soul.affect.repair_progress,
+        },
         "stage": { "id": stage.id, "label": stage.label, "trust": emotions.trust, "hint": stage.hint },
         "emotions": {
             "confidence": emotions.confidence, "trust": emotions.trust, "attachment": emotions.attachment,
@@ -394,8 +404,23 @@ struct SetupPayload {
     asr_api_key: String,
     #[serde(default)]
     qwen_api_key: String,
+    #[serde(default)]
+    emotion_classifier_enabled: bool,
+    #[serde(default)]
+    emotion_classifier_provider_id: String,
+    #[serde(default)]
+    emotion_classifier_model: String,
+    #[serde(default = "default_emotion_classifier_timeout_ms")]
+    emotion_classifier_timeout_ms: u64,
+    #[serde(default = "default_emotion_classifier_max_tokens")]
+    emotion_classifier_max_tokens: usize,
     workspace: String,
 }
+
+fn default_emotion_classifier_timeout_ms() -> u64 { 1500 }
+
+fn default_emotion_classifier_max_tokens() -> usize { 256 }
+
 
 fn setup_status_value(state: &AppState) -> Result<serde_json::Value, String> {
     let paths = state.paths.read().map_err(|error| error.to_string())?.clone();
@@ -429,6 +454,16 @@ fn setup_status_value(state: &AppState) -> Result<serde_json::Value, String> {
     let asr_key_env = if asr_protocol == "qwen_omni" && services.config.asr.protocol.trim().is_empty() {
         services.config.qwen.api_key_env.clone()
     } else { services.config.asr.api_key_env.clone() };
+    let emotion_classifier_provider = services.config.emotion_classifier.provider_id.trim();
+    let emotion_classifier_model = services.config.emotion_classifier.model.trim();
+    let emotion_classifier_provider_config = services.config.provider(emotion_classifier_provider);
+    let emotion_classifier_ready = !services.config.emotion_classifier.enabled
+        || (!emotion_classifier_provider.is_empty()
+            && !emotion_classifier_model.is_empty()
+            && emotion_classifier_provider_config
+                .as_ref()
+                .map(|provider| std::env::var_os(&provider.api_key_env).is_some())
+                .unwrap_or(false));
     Ok(serde_json::json!({
         "setupCompleted": preferences.setup_completed,
         "needsSetup": !preferences.setup_completed || !llm_ready,
@@ -463,6 +498,14 @@ fn setup_status_value(state: &AppState) -> Result<serde_json::Value, String> {
             "language": services.config.asr.language,
             "apiKeyEnv": asr_key_env,
             "apiKeyConfigured": std::env::var_os(&asr_key_env).is_some(),
+        },
+        "emotionClassifier": {
+            "enabled": services.config.emotion_classifier.enabled,
+            "providerId": services.config.emotion_classifier.provider_id,
+            "model": services.config.emotion_classifier.model,
+            "timeoutMs": services.config.emotion_classifier.timeout_ms,
+            "maxTokens": services.config.emotion_classifier.max_tokens,
+            "ready": emotion_classifier_ready,
         },
         "avatar": { "available": avatar_asset_path(&paths.data_root).is_file() },
         "sidecar": { "available": paths.sidecar.available(), "description": paths.sidecar.description() },
@@ -543,6 +586,26 @@ async fn save_setup(state: State<'_, AppState>, setup: SetupPayload) -> Result<s
     config.asr.language = default_if_empty(&setup.asr_language, "zh");
     config.asr.api_key_env = validate_key_env(&setup.asr_api_key_env, "FURINA_ASR_API_KEY")?;
     validate_asr_setup(&config)?;
+    let classifier_timeout_ms = setup.emotion_classifier_timeout_ms.clamp(500, 1500);
+    let classifier_max_tokens = setup.emotion_classifier_max_tokens.clamp(32, 512);
+    if setup.emotion_classifier_enabled {
+        if setup.emotion_classifier_provider_id.trim().is_empty() {
+            return Err("启用情绪分类器时必须选择 LLM 提供方".into());
+        }
+        if setup.emotion_classifier_model.trim().is_empty() {
+            return Err("启用情绪分类器时必须填写模型名称".into());
+        }
+        if config.provider(setup.emotion_classifier_provider_id.trim()).is_none() {
+            return Err(format!("找不到情绪分类器提供方: {}", setup.emotion_classifier_provider_id.trim()));
+        }
+    }
+    config.emotion_classifier = EmotionClassifierConfig {
+        enabled: setup.emotion_classifier_enabled,
+        provider_id: setup.emotion_classifier_provider_id.trim().to_string(),
+        model: setup.emotion_classifier_model.trim().to_string(),
+        timeout_ms: classifier_timeout_ms,
+        max_tokens: classifier_max_tokens,
+    };
     runtime::atomic_write(&config_path, serde_yaml::to_string(&config).map_err(|error| error.to_string())?.as_bytes())
         .map_err(|error| error.to_string())?;
     let mut secrets = read_secrets_map(&secrets_path);
@@ -686,6 +749,28 @@ async fn validate_provider(state: State<'_, AppState>, kind: String) -> Result<S
         "llm" => app::build_llm(&config).map_err(|error| error.to_string())?.ping().await.map_err(|error| error.to_string()),
         "tts" => { VoiceClient::from_config(&config, &paths.voice_dir()).map_err(|error| error.to_string())?; Ok("TTS 配置有效".into()) },
         "asr" => { AsrClient::from_config(&config).map_err(|error| error.to_string())?; Ok("ASR 配置有效".into()) },
+        "emotion_classifier" => {
+            let classifier = &config.emotion_classifier;
+            if !classifier.enabled {
+                return Ok("情绪分类器未启用".into());
+            }
+            if classifier.provider_id.trim().is_empty() || classifier.model.trim().is_empty() {
+                return Err("情绪分类器需要提供方和模型".into());
+            }
+            let mut provider = config
+                .provider(classifier.provider_id.trim())
+                .ok_or_else(|| format!("找不到情绪分类器提供方: {}", classifier.provider_id))?;
+            provider.model = classifier.model.clone();
+            let mut probe_config = config.clone();
+            probe_config.llm.active_provider = Some(provider.id.clone());
+            probe_config.llm.providers = vec![provider];
+            app::build_llm(&probe_config)
+                .map_err(|error| error.to_string())?
+                .ping()
+                .await
+                .map(|_| format!("情绪分类器连接正常（{}）", classifier.model))
+                .map_err(|error| error.to_string())
+        }
         _ => Err("未知的 provider 类型".into()),
     }
 }

@@ -79,10 +79,21 @@ export default function SetupWizard({ initialStatus, onClose, onUpdated }) {
       let llmOk = true;
       try { llmResult = await invoke("validate_provider", { kind: "llm" }); }
       catch (reason) { llmOk = false; llmResult = "连接测试失败：" + messageOf(reason); }
+      let emotionClassifierResult = form.emotionClassifierEnabled ? "未测试" : "未启用";
+      let emotionClassifierOk = !form.emotionClassifierEnabled;
+      if (form.emotionClassifierEnabled) {
+        try {
+          emotionClassifierResult = await invoke("validate_provider", { kind: "emotion_classifier" });
+          emotionClassifierOk = true;
+        } catch (reason) {
+          emotionClassifierResult = "连接测试失败：" + messageOf(reason);
+          emotionClassifierOk = false;
+        }
+      }
       let doctor = {};
       try { doctor = await invoke("doctor"); }
       catch (reason) { doctor = { service_errors: [messageOf(reason)] }; }
-      setDiagnostics({ ...doctor, llmResult, llmOk });
+      setDiagnostics({ ...doctor, llmResult, llmOk, emotionClassifierResult, emotionClassifierOk });
       setNotice("设置已保存，运行时已重新加载。");
       setStep(4);
     } catch (reason) { setError(messageOf(reason)); }
@@ -144,6 +155,17 @@ function ModelStep({ form, update, chooseWorkspace, keyConfigured }) {
     <Field label="接口地址"><input value={form.llmBaseUrl} onChange={(event) => update("llmBaseUrl", event.target.value)} /></Field>
     <Field label="模型"><input value={form.llmModel} onChange={(event) => update("llmModel", event.target.value)} /></Field>
     <Field label={"API Key" + (keyConfigured ? "（已配置，留空保持不变）" : "")}><input type="password" value={form.llmApiKey} onChange={(event) => update("llmApiKey", event.target.value)} /></Field>
+    <div className="voice-config-block">
+      <ServiceToggle title="情绪分类器（高级，可选）" enabled={form.emotionClassifierEnabled} onToggle={(value) => update("emotionClassifierEnabled", value)}>
+        <small className="setup-help">只分析当前输入与最近两轮对话；1500ms 内失败会自动回退关键词规则，不阻断聊天。</small>
+      </ServiceToggle>
+      {form.emotionClassifierEnabled && <>
+        <Field label="提供方 ID"><input value={form.emotionClassifierProviderId} onChange={(event) => update("emotionClassifierProviderId", event.target.value)} /></Field>
+        <Field label="轻量模型"><input value={form.emotionClassifierModel} onChange={(event) => update("emotionClassifierModel", event.target.value)} /></Field>
+        <Field label="超时（500–1500ms）"><input type="number" min="500" max="1500" step="100" value={form.emotionClassifierTimeoutMs} onChange={(event) => update("emotionClassifierTimeoutMs", Number(event.target.value))} /></Field>
+        <Field label="Token 上限（32–512）"><input type="number" min="32" max="512" step="32" value={form.emotionClassifierMaxTokens} onChange={(event) => update("emotionClassifierMaxTokens", Number(event.target.value))} /></Field>
+      </>}
+    </div>
     <Field label="Agent 工作区"><div className="path-control"><input value={form.workspace} onChange={(event) => update("workspace", event.target.value)} /><button className="quiet" onClick={chooseWorkspace}>选择</button></div></Field>
   </div>;
 }

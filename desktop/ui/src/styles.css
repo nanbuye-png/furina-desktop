@@ -557,6 +557,7 @@ body {
 .preset-buttons button { padding: 6px 9px; font-size: 11px; }
 .voice-config-block { margin: 14px 0; padding: 15px; border: 1px solid rgba(142, 168, 198, 0.18); border-radius: 13px; background: rgba(4, 16, 35, 0.42); }
 .voice-config-block h3 { margin: 0 0 13px; color: #d8c49a; font-family: "Noto Serif SC", serif; font-size: 15px; }
+.setup-help { display: block; color: var(--muted); line-height: 1.6; }
 .avatar-drop { min-height: 250px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9px; border: 1px dashed rgba(111, 208, 255, 0.32); border-radius: 18px; background: radial-gradient(circle at 50% 60%, rgba(72, 169, 230, 0.15), transparent 54%), rgba(3, 14, 31, 0.45); }
 .avatar-drop b { margin-top: 8px; font-family: "Noto Serif SC", serif; font-size: 18px; }
 .avatar-drop small { color: var(--muted); }

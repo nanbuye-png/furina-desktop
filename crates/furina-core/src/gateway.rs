@@ -32,6 +32,9 @@ impl PermissionGateway {
             ActionKind::WriteFile { .. } | ActionKind::GitCommit { .. } => Verdict::RequireApproval,
             ActionKind::RunCommand { command } => {
                 let norm = normalize_command(command);
+                if is_permanently_blocked_command(&norm) {
+                    return Verdict::Block("命令被安全策略永久拦截：删除、批量删除或破坏性 Git 操作不可执行".into());
+                }
                 for d in &self.danger_patterns {
                     if norm.contains(&normalize_command(d)) {
                         return Verdict::Block(format!("命令被安全策略拦截（危险模式：{d}）"));
@@ -62,6 +65,23 @@ impl PermissionGateway {
         ];
         TESTS.iter().any(|t| norm.starts_with(t))
     }
+}
+
+fn is_permanently_blocked_command(norm: &str) -> bool {
+    let tokens: Vec<&str> = norm.split_whitespace().collect();
+    let first = tokens.first().copied().unwrap_or_default();
+    if matches!(first, "del" | "erase" | "rd" | "rmdir" | "rm" | "remove-item") {
+        return true;
+    }
+    if first == "git" && tokens.iter().any(|token| *token == "clean") {
+        return true;
+    }
+    if first == "git" && tokens.iter().any(|token| *token == "reset") {
+        return tokens.iter().any(|token| *token == "--hard");
+    }
+    let recursive = tokens.iter().any(|token| matches!(*token, "-r" | "-rf" | "-fr" | "--recursive" | "-recurse"));
+    let wildcard = norm.contains('*') || norm.contains('?');
+    recursive && wildcard
 }
 
 pub fn normalize_command(command: &str) -> String {
@@ -161,6 +181,25 @@ mod tests {
         assert!(matches!(gw().check(&ActionKind::RunCommand { command: "rm -rf /".into() }), Verdict::Block(_)));
         assert!(matches!(gw().check(&ActionKind::RunCommand { command: "mysql -e 'DROP DATABASE x'".into() }), Verdict::Block(_)));
         assert!(matches!(gw().check(&ActionKind::RunCommand { command: "git push --force origin main".into() }), Verdict::Block(_)));
+    }
+
+    #[test]
+    fn permanently_block_deletion_and_destructive_git_commands() {
+        for command in [
+            "rm file.txt",
+            "rm -rf build",
+            "del file.txt",
+            "erase file.txt",
+            "rd /s /q build",
+            "rmdir /s /q build",
+            "Remove-Item file.txt",
+            "Remove-Item -Recurse build",
+            "git clean -fd",
+            "git reset --hard HEAD",
+            "rm -r *.tmp",
+        ] {
+            assert!(matches!(gw().check(&ActionKind::RunCommand { command: command.into() }), Verdict::Block(_)), "{command}");
+        }
     }
 
     #[test]

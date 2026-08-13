@@ -124,7 +124,7 @@ impl PromptContextProvider for FixedContext {
     fn observe_user_text(&self, _text: &str) {}
     fn observe_event(&self, _event: &Event) {}
     fn context_block(&self) -> String {
-        "[灵魂状态]\n心情：淡定\n关系边界：拒绝——强度高；接纳——低".into()
+        "[当前灵魂状态]\n当前情绪：calm，强度 0，趋势 stable\n关系：陌生（信任 20）".into()
     }
 }
 
@@ -800,6 +800,42 @@ async fn provider_switch_keeps_prompt_identical() {
         msgs_a, msgs_b,
         "切换模型提供方不应改变发送给 LLM 的消息（人格一致性）"
     );
+}
+
+#[tokio::test]
+async fn runtime_soul_context_is_current_request_only() {
+    if !python_available() {
+        return;
+    }
+    let cfg = Config::load(&repo_root().join("desktop/resources/defaults/config.yaml")).unwrap();
+    let ws = temp_fixture_ws();
+    let sink = Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new()))));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(
+        cfg,
+        ws.clone(),
+        spawn_sidecar(&ws, sink.clone()).await,
+        Box::new(RecordingLlm { seen: seen.clone() }),
+        sink,
+        Box::new(AutoApprove),
+        "system".into(),
+    );
+    agent.set_prompt_context(Box::new(FixedContext));
+
+    agent.run_task("你好").await.unwrap();
+    agent.run_task("今天怎么样").await.unwrap();
+
+    let transcript = serde_json::to_string(&agent.transcript_snapshot()).unwrap();
+    assert!(!transcript.contains("当前灵魂状态"));
+
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        let serialized = serde_json::to_string(request).unwrap();
+        assert_eq!(serialized.matches("当前灵魂状态").count(), 1);
+        assert!(!serialized.contains("表达策略"));
+        assert!(!serialized.contains("回复预算"));
+    }
 }
 
 #[tokio::test]

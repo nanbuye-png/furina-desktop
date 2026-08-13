@@ -2,13 +2,13 @@
 
 > 一个拥有稳定人格、长期记忆、情绪连续性与关系成长能力的桌面 AI 生命体。
 
-![Version](https://img.shields.io/badge/version-0.1.3--dev-5b8def) [![Desktop](https://img.shields.io/badge/Desktop-Tauri%202-24c8db)](https://v2.tauri.app/) [![Frontend](https://img.shields.io/badge/UI-React%20%2B%20Vite-646cff)](desktop/ui) [![Core](https://img.shields.io/badge/Core-Rust-ce412b)](crates/furina-core)
+![Version](https://img.shields.io/badge/version-0.1.4--dev-5b8def) [![Desktop](https://img.shields.io/badge/Desktop-Tauri%202-24c8db)](https://v2.tauri.app/) [![Frontend](https://img.shields.io/badge/UI-React%20%2B%20Vite-646cff)](desktop/ui) [![Core](https://img.shields.io/badge/Core-Rust-ce412b)](crates/furina-core)
 
 Furina Desktop 是 Furina Personal AI Lifeform 的独立桌面实现。她不只是普通聊天窗口：本地 Runtime 维护人格、情绪、关系和记忆，大语言模型负责生成语言，工具系统负责执行任务，权限网关负责守住边界。
 
 项目原则：**人格是灵魂，Runtime 是大脑，工具是双手，安全是边界，验证是生命线。**
 
-历史 Furina Agent CLI 已冻结在 [nanbuye-png/furina-agent](https://github.com/nanbuye-png/furina-agent) 的 Tag/Release 中；本仓库自 v0.1.1 起是唯一后续开发主线。Desktop v0.1.2 已完成功能验收，当前进入 **Desktop v0.1.3 Persona 开发阶段**，不读取或共享 CLI 的本地历史数据。
+历史 Furina Agent CLI 已冻结在 [nanbuye-png/furina-agent](https://github.com/nanbuye-png/furina-agent) 的 Tag/Release 中；本仓库自 v0.1.1 起是唯一后续开发主线。Desktop v0.1.2 已完成功能验收，当前进入 **Desktop v0.1.4 Persona v2.0 开发阶段**，不读取或共享 CLI 的本地历史数据。
 
 ## 目录
 
@@ -33,7 +33,7 @@ Furina Desktop 是 Furina Personal AI Lifeform 的独立桌面实现。她不只
 
 | 项目 | 状态 |
 | --- | --- |
-| 当前版本 | **Desktop v0.1.3 Persona（开发中）** |
+| 当前版本 | **Desktop v0.1.4 Persona v2.0（开发中）** |
 | 开发主线 | 本仓库 `main` |
 | 桌面框架 | Tauri 2 |
 | 前端 | React 18 + Vite 5 |
@@ -44,7 +44,7 @@ Furina Desktop 是 Furina Personal AI Lifeform 的独立桌面实现。她不只
 | Desktop 独立启动 | 已验证 |
 | CLI 数据共享 | **不共享** |
 
-v0.1.3 的当前重点是数字化身份、现实边界、自然短回复和动态表达策略。普通闲聊默认 1–3 句，舞台语气仅在明确表演请求或特殊角色话题中启用。
+v0.1.4 的当前重点是稳定人格底色、持续情绪、上下文自然变化与 Agent 零主动错误边界。普通交流倾向简洁，但会根据问题复杂度自然展开；舞台语气仅在明确表演请求或特殊角色话题中启用。
 
 2026-08-11 分离验收结果：Rust 156 项测试通过、Python 28 项测试通过、React/Vite 生产构建通过，并在删除本地 CLI 目录后完成 Desktop 独立启动检查。
 
@@ -350,7 +350,7 @@ python -m unittest discover -s python/furina_tools/tests -v
 
 ### RC1 验收
 
-v0.1.2 的 Windows Sandbox 验收流程与历史结果保留在 [docs/RC_ACCEPTANCE_TEST_0.1.2.md](docs/RC_ACCEPTANCE_TEST_0.1.2.md)。v0.1.3 人格回归使用 [docs/PERSONA_V2_ACCEPTANCE.md](docs/PERSONA_V2_ACCEPTANCE.md) 与 `tests/persona/persona_v2_cases.yaml`。
+v0.1.2 的 Windows Sandbox 验收流程与历史结果保留在 [docs/RC_ACCEPTANCE_TEST_0.1.2.md](docs/RC_ACCEPTANCE_TEST_0.1.2.md)。v0.1.4 人格回归使用 [docs/PERSONA_V2_ACCEPTANCE.md](docs/PERSONA_V2_ACCEPTANCE.md) 与 `tests/persona/persona_v2_cases.yaml`。
 
 ## 文档导航
 
@@ -359,7 +359,7 @@ v0.1.2 的 Windows Sandbox 验收流程与历史结果保留在 [docs/RC_ACCEPTA
 | [docs/README.md](docs/README.md) | 文档总索引与阅读顺序 |
 | [docs/STARTUP_GUIDE.md](docs/STARTUP_GUIDE.md) | 安装、配置、启动、Avatar 与故障排查 |
 | [docs/RC_ACCEPTANCE_TEST_0.1.2.md](docs/RC_ACCEPTANCE_TEST_0.1.2.md) | Windows Sandbox RC1 验收、稳定性监控与发布门禁 |
-| [docs/PERSONA_V2_ACCEPTANCE.md](docs/PERSONA_V2_ACCEPTANCE.md) | v0.1.3 人格、现实边界和短回复回归验收 |
+| [docs/PERSONA_V2_ACCEPTANCE.md](docs/PERSONA_V2_ACCEPTANCE.md) | v0.1.4 Persona v2.0 人格、现实边界和短回复回归验收 |
 | [docs/FURINA_DESKTOP_UI_SPEC_V1.md](docs/FURINA_DESKTOP_UI_SPEC_V1.md) | Desktop 分层架构、状态协议、事件协议和 UI 边界 |
 | [docs/FURINA_PROJECT_FREEZE_REPORT.md](docs/FURINA_PROJECT_FREEZE_REPORT.md) | 当前冻结接口、稳定层和开发边界 |
 | [docs/FURINA_SOUL_ROADMAP.md](docs/FURINA_SOUL_ROADMAP.md) | Soul Engine 长期演进路线 |

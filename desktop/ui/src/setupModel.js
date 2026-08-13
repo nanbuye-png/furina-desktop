@@ -4,6 +4,11 @@ export function createInitialSetupForm(status = {}) {
     llmBaseUrl: status.llm?.baseUrl || "https://api.deepseek.com",
     llmModel: status.llm?.model || "deepseek-chat",
     llmApiKey: "",
+    emotionClassifierEnabled: status.emotionClassifier?.enabled ?? false,
+    emotionClassifierProviderId: status.emotionClassifier?.providerId || "desktop",
+    emotionClassifierModel: status.emotionClassifier?.model || status.llm?.model || "deepseek-chat",
+    emotionClassifierTimeoutMs: status.emotionClassifier?.timeoutMs || 1500,
+    emotionClassifierMaxTokens: status.emotionClassifier?.maxTokens || 256,
     workspace: runtime.workspace_root || runtime.workspaceRoot || "",
     voiceEnabled: status.voice?.enabled ?? false,
     voiceProvider: status.voice?.provider || "Fish Audio",
@@ -32,6 +37,13 @@ export function validateSetupForm(form, status = {}) {
   if (!form.llmBaseUrl.trim() || !form.llmModel.trim()) return { step: 1, message: "填写模型地址和模型名称。" };
   if (!form.workspace.trim()) return { step: 1, message: "选择 Agent 工作区。" };
   if (!status.llm?.apiKeyConfigured && !form.llmApiKey.trim()) return { step: 1, message: "首次设置需要填写 LLM API Key。" };
+  if (form.emotionClassifierEnabled) {
+    if (!form.emotionClassifierProviderId.trim() || !form.emotionClassifierModel.trim()) return { step: 1, message: "启用情绪分类器时需要填写提供方 ID 和模型。" };
+    const timeout = Number(form.emotionClassifierTimeoutMs);
+    const maxTokens = Number(form.emotionClassifierMaxTokens);
+    if (!Number.isFinite(timeout) || timeout < 500 || timeout > 1500) return { step: 1, message: "情绪分类器超时必须在 500–1500ms 之间。" };
+    if (!Number.isFinite(maxTokens) || maxTokens < 32 || maxTokens > 512) return { step: 1, message: "情绪分类器 Token 上限必须在 32–512 之间。" };
+  }
   if (form.voiceEnabled) {
     if (!form.voiceProvider.trim() || !form.voiceProtocol.trim()) return { step: 2, message: "填写 TTS 服务名称并选择协议。" };
     if (!form.voiceEndpoint.trim() || !form.voiceModel.trim()) return { step: 2, message: "启用 TTS 时需要填写接口地址和模型。" };
@@ -78,6 +90,7 @@ export function projectDiagnosticRows(diagnostics, status = {}) {
   const asrError = serviceErrors.find((item) => String(item).startsWith("ASR:"));
   return [
     ["LLM", diagnostics.llmResult || "未测试", diagnostics.llmOk ?? Boolean(diagnostics.llmResult)],
+    ["情绪分类器", diagnostics.emotionClassifierResult || (status.emotionClassifier?.enabled ? "未测试" : "未启用"), diagnostics.emotionClassifierOk ?? !status.emotionClassifier?.enabled],
     ["Sidecar", sidecarDetail, Boolean(sidecarReady)],
     ["TTS", diagnostics.voice ? "已就绪" : status.voice?.enabled ? (ttsError || "配置不可用，已降级") : "未启用", Boolean(diagnostics.voice) || !status.voice?.enabled],
     ["ASR", diagnostics.asr ? "已就绪" : status.asr?.enabled ? (asrError || "配置不可用，已降级") : "未启用", Boolean(diagnostics.asr) || !status.asr?.enabled],

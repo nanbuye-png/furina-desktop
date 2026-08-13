@@ -35,6 +35,28 @@ fn content_mut(m: &mut ChatMessage) -> Option<&mut String> {
     }
 }
 
+/// Remove runtime-only Soul instructions from persisted or summarized messages.
+///
+/// Soul context describes the current turn and must never become part of the
+/// conversation history. This also cleans transcripts created before the
+/// current-turn-only assembly was introduced.
+pub fn strip_runtime_soul_context(text: &str) -> String {
+    text.split("\n\n[当前灵魂状态]")
+        .next()
+        .unwrap_or(text)
+        .trim()
+        .to_string()
+}
+
+fn without_runtime_soul_context(message: &ChatMessage) -> ChatMessage {
+    match message {
+        ChatMessage::User { content } => ChatMessage::User {
+            content: strip_runtime_soul_context(content),
+        },
+        _ => message.clone(),
+    }
+}
+
 pub struct ContextManager {
     pub per_request_max_tokens: usize,
     pub keep_recent: usize,
@@ -92,13 +114,13 @@ impl ContextManager {
             let mut summary = String::from("以下是较早会话的压缩摘要（保留关键信息）：\n");
             for m in middle {
                 if let Some(c) = message_content(m) {
-                    summary.push_str(&truncate_text(c, 1000));
+                    summary.push_str(&truncate_text(&strip_runtime_soul_context(c), 1000));
                     summary.push('\n');
                 }
             }
             out.push(ChatMessage::User { content: truncate_text(&summary, self.summary_max_chars) });
         }
-        out.extend(recent.iter().cloned());
+        out.extend(recent.iter().map(without_runtime_soul_context));
 
         // 仍超预算则逐条截断
         let mut total: usize = out.iter().map(|m| estimate_tokens(message_content(m).unwrap_or_default())).sum();
@@ -199,6 +221,26 @@ mod tests {
     }
 
     #[test]
+    fn fit_strips_runtime_soul_context_from_recent_messages() {
+        let cm = ContextManager {
+            per_request_max_tokens: 10_000,
+            keep_recent: 20,
+            summary_max_chars: 10_000,
+            message_max_chars: 6_000,
+        };
+        let msgs = vec![
+            msg("system", "sys"),
+            msg("user", "任务：你好\n\n[当前灵魂状态]\n表达策略：sulky"),
+            msg("assistant", "你好。"),
+        ];
+        let out = cm.fit(&msgs);
+        let serialized = serde_json::to_string(&out).unwrap();
+        assert!(!serialized.contains("当前灵魂状态"));
+        assert!(!serialized.contains("表达策略"));
+        assert!(serialized.contains("任务：你好"));
+    }
+
+    #[test]
     fn fit_summarizes_old_turns() {
         let cm = ContextManager {
             per_request_max_tokens: 1_000,
@@ -215,6 +257,28 @@ mod tests {
         assert!(out.len() < msgs.len());
         assert!(matches!(out[0], ChatMessage::System { .. }));
         assert!(out.iter().any(|m| matches!(m, ChatMessage::User { content } if content.contains("压缩摘要"))));
+    }
+
+    #[test]
+    fn fit_does_not_copy_runtime_soul_context_into_summary() {
+        let cm = ContextManager {
+            per_request_max_tokens: 1_000,
+            keep_recent: 2,
+            summary_max_chars: 1_000,
+            message_max_chars: 6_000,
+        };
+        let mut msgs = vec![msg("system", "sys")];
+        for i in 0..10 {
+            msgs.push(msg(
+                "user",
+                &format!("turn {i}\n\n[当前灵魂状态]\n表达策略：playful"),
+            ));
+            msgs.push(msg("assistant", "ok"));
+        }
+        let out = cm.fit(&msgs);
+        let serialized = serde_json::to_string(&out).unwrap();
+        assert!(!serialized.contains("当前灵魂状态"));
+        assert!(!serialized.contains("表达策略"));
     }
 
     #[test]

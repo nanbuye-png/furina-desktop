@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use config::MoodKind;
-pub use emotion::EmotionState;
+pub use emotion::{AffectState, EmotionState};
 pub use memory::MemoryRecord;
 pub use memory::MemoryDraft;
 pub use memory::MemoryStore;
@@ -38,10 +38,104 @@ pub struct IntentInfo {
     pub value: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct TraitState {
+    pub vanity: f64,
+    pub sensitivity: f64,
+    pub defensiveness: f64,
+    pub playfulness: f64,
+    pub dependency: f64,
+    pub avoidance: f64,
+    pub courage: f64,
+    pub emotional_expression: f64,
+    pub updated_at: u128,
+    pub daily_anchor: u128,
+    pub daily_change: f64,
+}
+
+impl Default for TraitState {
+    fn default() -> Self {
+        Self {
+            vanity: 60.0,
+            sensitivity: 65.0,
+            defensiveness: 55.0,
+            playfulness: 55.0,
+            dependency: 35.0,
+            avoidance: 45.0,
+            courage: 65.0,
+            emotional_expression: 35.0,
+            updated_at: 0,
+            daily_anchor: 0,
+            daily_change: 0.0,
+        }
+    }
+}
+
+impl TraitState {
+    const MAX_STEP: f64 = 0.5;
+    const MAX_DAILY_CHANGE: f64 = 1.0;
+
+    pub fn value(&self, name: &str) -> Option<f64> {
+        match name {
+            "vanity" => Some(self.vanity),
+            "sensitivity" => Some(self.sensitivity),
+            "defensiveness" => Some(self.defensiveness),
+            "playfulness" => Some(self.playfulness),
+            "dependency" => Some(self.dependency),
+            "avoidance" => Some(self.avoidance),
+            "courage" => Some(self.courage),
+            "emotional_expression" => Some(self.emotional_expression),
+            _ => None,
+        }
+    }
+
+    /// Apply a bounded long-term personality change. This is intentionally
+    /// separate from per-turn emotion updates, so chat cannot rewrite traits.
+    pub fn apply_delta(&mut self, name: &str, delta: f64, now: u128) -> bool {
+        let defaults = Self::default();
+        if self.daily_anchor == 0 || now.saturating_sub(self.daily_anchor) >= 86_400_000 {
+            self.daily_anchor = now;
+            self.daily_change = 0.0;
+        }
+        let remaining = (Self::MAX_DAILY_CHANGE - self.daily_change).max(0.0);
+        let bounded = delta.clamp(-Self::MAX_STEP, Self::MAX_STEP);
+        let applied = bounded.abs().min(remaining) * bounded.signum();
+        if applied == 0.0 {
+            return false;
+        }
+        let current = self.value(name).unwrap_or(0.0);
+        let baseline = defaults.value(name).unwrap_or(current);
+        let lower = (baseline - 20.0).max(0.0);
+        let upper = if name == "dependency" { 65.0_f64.min(baseline + 20.0) } else { (baseline + 20.0).min(100.0) };
+        let next = (current + applied).clamp(lower, upper);
+        let actual = next - current;
+        if actual == 0.0 {
+            return false;
+        }
+        match name {
+            "vanity" => self.vanity = next,
+            "sensitivity" => self.sensitivity = next,
+            "defensiveness" => self.defensiveness = next,
+            "playfulness" => self.playfulness = next,
+            "dependency" => self.dependency = next,
+            "avoidance" => self.avoidance = next,
+            "courage" => self.courage = next,
+            "emotional_expression" => self.emotional_expression = next,
+            _ => return false,
+        }
+        self.daily_change += actual.abs();
+        self.updated_at = now;
+        true
+    }
+}
+
 /// 灵魂状态门面：情绪 + 关系 + 记忆 + 最近行为意图。
 pub struct Soul {
     cfg: SoulConfig,
     pub emotion: EmotionState,
+    pub affect: AffectState,
+    pub traits: TraitState,
     pub relationship: RelationshipState,
     pub memory: MemoryStore,
     pub last_intent: Option<IntentInfo>,
@@ -64,12 +158,16 @@ impl Soul {
         let emotion = load_emotion(&dir)
             .unwrap_or_else(|| EmotionState::from_config(&cfg.emotion_model, now))
             .decayed(&cfg.emotion_model, now);
+        let affect = load_affect(&dir).unwrap_or_default();
+        let traits = load_traits(&dir).unwrap_or_default();
         let relationship = load_relationship(&dir);
         let memory = MemoryStore::load(&dir);
         let meta = load_meta(&dir);
         Self {
             cfg,
             emotion,
+            affect,
+            traits,
             relationship,
             memory,
             last_intent: None,
@@ -94,36 +192,31 @@ impl Soul {
         self.relationship.stage(&self.cfg.relationship_model, self.emotion.trust)
     }
 
-    /// 表达策略（natural / playful / flustered / gentle / serious / theatrical）：
-    /// 由 behavior_rules.yaml 的 expression_strategies 规则按意图×心情×信任选择；
-    /// 只影响语气与表达风格，不影响任何判断。
+    /// 选择当前表达策略。策略只改变闲聊表现，不改变事实、权限或工具行为。
     pub fn expression_strategy(&self) -> String {
-        let mood = self.mood().as_str();
-        let trust = self.emotion.trust;
+        self.expression_strategy_for("chat")
+    }
+
+    fn expression_strategy_for(&self, mode: &str) -> String {
         let intent = self.last_intent.as_ref().map(|info| info.intent.as_str());
-        for s in self
-            .cfg
-            .behavior_rules
-            .expression_strategies
-            .iter()
-            .filter(|strategy| !strategy.is_default)
-        {
-            let mood_ok = s.moods.is_empty() || s.moods.iter().any(|m| m == mood);
-            let intent_ok = s.intents.is_empty()
-                || intent.is_some_and(|current| s.intents.iter().any(|item| item == current));
-            let min_ok = s.min_trust.map_or(true, |t| trust >= t);
-            let max_ok = s.max_trust.map_or(true, |t| trust <= t);
-            if mood_ok && intent_ok && min_ok && max_ok {
-                return s.id.clone();
-            }
+        if mode == "agent" { return "serious".into(); }
+        if matches!(intent, Some("perform_theatrically")) { return "theatrical".into(); }
+        if matches!(intent, Some("refuse_with_boundary" | "stay_calm")) { return "serious".into(); }
+        if matches!(intent, Some("show_off_but_flustered")) { return "flustered".into(); }
+        if matches!(intent, Some("show_jealousy_without_control")) { return "jealous".into(); }
+        if matches!(intent, Some("answer_with_uncertainty")) { return "uncertain".into(); }
+        if matches!(intent, Some("admit_vulnerability")) { return "vulnerable".into(); }
+        if self.affect.primary == "annoyed" || self.affect.primary == "hurt" {
+            return match self.affect.intensity {
+                x if x >= 70.0 => "withdrawn".into(),
+                x if x >= 45.0 => "guarded".into(),
+                _ => "sulky".into(),
+            };
         }
-        self.cfg
-            .behavior_rules
-            .expression_strategies
-            .iter()
-            .find(|s| s.is_default)
-            .map(|s| s.id.clone())
-            .unwrap_or_else(|| "natural".into())
+        if self.affect.primary == "sad" { return "vulnerable".into(); }
+        if matches!(intent, Some("listen_carefully" | "empathize")) { return "gentle".into(); }
+        if self.mood() == MoodKind::Proud || self.mood() == MoodKind::Happy { return "playful".into(); }
+        "natural".into()
     }
 
     /// 下一关系阶段与还差多少信任（None 表示已是最高阶段）。
@@ -138,24 +231,53 @@ impl Soul {
 
     /// 用户文本 → 情绪增量 + 行为意图 + 情感记忆。
     pub fn observe_text(&mut self, text: &str) -> bool {
+        let trigger_id = detect_text_trigger(text, &self.cfg.behavior_rules).map(|trigger| trigger.id.clone());
+        self.observe_trigger(trigger_id.as_deref())
+    }
+
+    /// 已验证的语义分类结果复用同一套状态转移；未知 ID 自动按无触发处理。
+    pub fn observe_trigger_id(&mut self, trigger_id: &str) -> bool {
+        self.observe_trigger(Some(trigger_id))
+    }
+
+    fn observe_trigger(&mut self, trigger_id: Option<&str>) -> bool {
         self.last_interaction_ms = Some(now_ms());
         self.relationship.interaction_count += 1;
-        let Some(t) = detect_text_trigger(text, &self.cfg.behavior_rules) else {
+        let Some(t) = trigger_id.and_then(|id| {
+            self.cfg.behavior_rules.text_triggers.iter().find(|trigger| trigger.id == id)
+        }) else {
             self.last_intent = None;
+            self.refresh_affect(None);
             self.dirty = true;
             return false;
         };
-        match t.id.as_str() {
+        let trigger_id = t.id.clone();
+        let trigger_cause = t.cause.clone();
+        let trigger_intent = t.intent.clone();
+        let trigger_value = t.value.clone();
+        let trigger_deltas = t.deltas.clone();
+        if trigger_id == "jealousy_cue" && !matches!(self.stage().id.as_str(), "familiar" | "trusted" | "partner") {
+            self.last_intent = None;
+            self.refresh_affect(None);
+            self.dirty = true;
+            return false;
+        }
+        match trigger_id.as_str() {
             "praise" => self.relationship.praise_count += 1,
             "confide" => self.relationship.confide_count += 1,
             "user_demeaning" => self.relationship.refuse_count += 1,
             _ => {}
         }
-        self.emotion.apply_deltas(&t.deltas);
-        let log_text = match t.id.as_str() {
+        self.emotion.apply_deltas(&trigger_deltas);
+        let log_text = match trigger_id.as_str() {
             "praise" => "被夸奖：心情转好，信任提升",
             "scold" => "被数落：有点委屈，信任微降",
             "user_demeaning" => "被羞辱/强迫：守住底线，信任明显下降",
+            "sincere_apology" => "用户认真解释并道歉：关系开始修复",
+            "cursory_apology" => "用户敷衍道歉：听见了，但情绪没有立刻恢复",
+            "identity_question" => "谈到身份与存在：允许自己犹豫",
+            "loneliness_question" => "谈到孤独：愿意露出一点脆弱",
+            "jealousy_cue" => "被拿来比较：有些吃味，但不控制用户",
             "confide" => "被倾诉：关系更近，信任提升",
             "sad" => "用户情绪低落：我想认真安慰她",
             "happy" => "用户心情不错：气氛轻松",
@@ -166,30 +288,45 @@ impl Soul {
             self.relationship.log(log_text);
         }
         self.last_intent = Some(IntentInfo {
-            intent: t.intent.clone(),
-            cause: Some(t.cause.clone()),
-            value: t.value.clone(),
+            intent: trigger_intent,
+            cause: Some(trigger_cause.clone()),
+            value: trigger_value,
         });
-        let (importance, valence, note) = match t.id.as_str() {
+        let (importance, valence, note) = match trigger_id.as_str() {
             "praise" => (60, 1i8, "（当时嘴上得意，心里其实很开心）"),
-            "scold" => (65, -1i8, "（有点委屈，但没记仇）"),
+            "scold" => (65, -1i8, "（有点委屈，这件事还需要时间消化）"),
             "confide" => (70, 0i8, "（我认真听了）"),
             "sad" => (55, -1i8, "（我想认真安慰她）"),
             "happy" => (50, 1i8, "（她的好心情也感染了我）"),
             "annoyed" => (45, -1i8, "（她有点烦躁，我先稳住）"),
             "user_demeaning" => (75, -1i8, "（我不太开心，但守住了底线）"),
+            "sincere_apology" => (70, 1i8, "（这次道歉说清了原因，我愿意慢慢缓和）"),
+            "cursory_apology" => (45, 0i8, "（听到了道歉，但还不能马上当作没发生）"),
+            "identity_question" => (55, 0i8, "（这个问题让我有些犹豫）"),
+            "loneliness_question" => (65, -1i8, "（我没有急着给出漂亮答案）"),
+            "jealousy_cue" => (55, -1i8, "（有点吃味，但不会要求用户排斥别人）"),
             _ => (40, 0i8, ""),
         };
-        if t.id != "theatrical_request" {
+        if trigger_id != "theatrical_request" {
             self.memory.add_unique(
                 "emotional",
-                format!("{} {note}", t.cause),
+                format!("{} {note}", trigger_cause),
                 importance,
                 valence,
-                vec![t.id.clone()],
+                vec![trigger_id.clone()],
             );
         }
         self.maybe_milestone();
+        self.refresh_affect(Some(&trigger_cause));
+        match trigger_id.as_str() {
+            "scold" | "user_demeaning" => {
+                self.affect.unresolved = true;
+                self.affect.repair_progress = 0.0;
+            }
+            "sincere_apology" => self.apply_repair(35.0),
+            "cursory_apology" => self.apply_repair(10.0),
+            _ => {}
+        }
         self.dirty = true;
         true
     }
@@ -320,70 +457,25 @@ impl Soul {
         ok
     }
 
-    /// 动态人格注入块（替换 v1 的单行心情提示）。
+    /// 动态人格注入块。只陈述当前状态事实，不规定本轮应采用的说话方式。
     pub fn context_block(&self) -> String {
-        let mood = self.mood();
-        let mut lines = vec![String::from("[灵魂状态]")];
-        lines.push(format!(
-            "身份：{}——{}",
-            self.cfg.identity.name, self.cfg.identity.core_values_summary
-        ));
-        let strategy = self.expression_strategy();
-        let style = self
-            .cfg
-            .personality
-            .expression_styles
-            .get(&strategy)
-            .or_else(|| self.cfg.personality.external_style.first());
-        if let Some(style) = style {
-            lines.push(format!("表达策略：{strategy}——{style}"));
+        self.context_block_for("chat")
+    }
+
+    pub fn context_block_for(&self, _mode: &str) -> String {
+        let mut lines = vec![String::from("[当前灵魂状态]")];
+        lines.push(format!("当前情绪：{}，强度 {:.0}，趋势 {}", self.affect.primary, self.affect.intensity, self.affect.trend));
+        if let Some(secondary) = self.affect.secondary.as_deref().filter(|value| !value.is_empty()) {
+            lines.push(format!("次要情绪：{secondary}"));
         }
-        if let Some(budget) = self.cfg.personality.reply_budgets.get(&strategy) {
-            lines.push(format!("回复预算：{budget}"));
+        if self.affect.unresolved {
+            lines.push("未解决事件：是".into());
         }
-        let cause = self
-            .last_intent
-            .as_ref()
-            .and_then(|i| i.cause.clone())
-            .unwrap_or_else(|| "最近的交互".into());
-        lines.push(format!("心情：{}（起因：{cause}）", mood.label()));
-        lines.push(format!("情绪：{}", self.emotion.summary()));
         let stage = self.stage();
-        lines.push(format!(
-            "关系：{}（信任 {:.0}｜互动 {} 次）{}",
-            stage.label, self.emotion.trust, self.relationship.interaction_count, stage.hint
-        ));
-        if !stage.refusal.is_empty() || !stage.acceptance.is_empty() {
-            lines.push(format!(
-                "关系边界：拒绝——{}；接纳——{}",
-                stage.refusal, stage.acceptance
-            ));
+        lines.push(format!("关系：{}（信任 {:.0}）", stage.label, self.emotion.trust));
+        if !self.affect.trigger.trim().is_empty() {
+            lines.push(format!("最近原因：{}", short(&self.affect.trigger, 80)));
         }
-        if let Some(i) = &self.last_intent {
-            match &i.value {
-                Some(v) => {
-                    let desc = self
-                        .cfg
-                        .values
-                        .values
-                        .get(v)
-                        .map(|vc| vc.description.as_str())
-                        .unwrap_or("");
-                    lines.push(format!("本次意图：{}（出于 {v}：{desc}）", i.intent));
-                }
-                None => lines.push(format!("本次意图：{}", i.intent)),
-            }
-        }
-        let mems = self.memory.top_k(now_ms(), mood, &self.cfg.memory_scoring, 3);
-        if !mems.is_empty() {
-            let joined = mems
-                .iter()
-                .map(|m| format!("{}（{}）", m.content, m.importance_score))
-                .collect::<Vec<_>>()
-                .join("；");
-            lines.push(format!("相关记忆：{joined}"));
-        }
-        lines.push("以上只影响语气与行为倾向，不得影响任何技术判断与安全决策。".into());
         lines.join("\n")
     }
 
@@ -496,6 +588,8 @@ impl Soul {
         std::fs::create_dir_all(&self.dir)?;
         let emotion_json = serde_json::to_string_pretty(&self.emotion)?;
         std::fs::write(self.dir.join("emotion.json"), emotion_json)?;
+        std::fs::write(self.dir.join("affect.json"), serde_json::to_string_pretty(&self.affect)?)?;
+        std::fs::write(self.dir.join("traits.json"), serde_json::to_string_pretty(&self.traits)?)?;
         let rel_json = serde_json::to_string_pretty(&self.relationship)?;
         std::fs::write(self.dir.join("relationship.json"), rel_json)?;
         let meta = serde_json::json!({
@@ -507,6 +601,76 @@ impl Soul {
         self.memory.save(&self.dir)?;
         self.dirty = false;
         Ok(())
+    }
+
+    fn refresh_affect(&mut self, trigger: Option<&str>) {
+        let now = now_ms();
+        let derived_mood = self.mood().as_str().to_string();
+        let previous = self.affect.clone();
+        let repairing = matches!(trigger, Some("真诚道歉" | "敷衍道歉"));
+        let mood = if repairing && previous.unresolved {
+            previous.primary.clone()
+        } else {
+            derived_mood
+        };
+        let derived_intensity = match mood.as_str() {
+            "annoyed" => self.emotion.stress,
+            "hurt" => (self.emotion.stress + (50.0 - self.emotion.confidence).max(0.0)) / 2.0,
+            "sad" => (40.0 - self.emotion.energy).max(0.0) + self.emotion.attachment * 0.25,
+            "proud" => self.emotion.pride,
+            "happy" => self.emotion.energy,
+            _ => 0.0,
+        }.clamp(0.0, 100.0);
+        let elapsed_hours = now.saturating_sub(previous.updated_at) as f64 / 3_600_000.0;
+        let time_factor = (-elapsed_hours / 2.0).exp();
+        let recovering_intensity = previous.intensity * time_factor;
+        let intensity = if repairing && previous.unresolved {
+            previous.intensity
+        } else if previous.primary == mood && trigger.is_none() && previous.intensity > 0.0 {
+            derived_intensity.min(recovering_intensity.max(derived_intensity.min(previous.intensity)))
+        } else {
+            derived_intensity
+        };
+        let changed = previous.primary != mood || (previous.intensity - intensity).abs() >= 8.0;
+        self.affect = AffectState {
+            primary: mood.clone(),
+            secondary: previous.secondary.clone(),
+            intensity,
+            trigger: trigger.unwrap_or(&previous.trigger).to_string(),
+            started_at: if changed { now } else { previous.started_at },
+            updated_at: now,
+            recover_after: if intensity >= 70.0 { now + 2 * 60 * 60 * 1000 } else { now + 20 * 60 * 1000 },
+            trend: if intensity < previous.intensity { "recovering" } else if intensity > previous.intensity { "rising" } else { "stable" }.into(),
+            unresolved: if repairing {
+                previous.unresolved
+            } else {
+                previous.unresolved && !matches!(mood.as_str(), "calm" | "happy" | "proud")
+            },
+            conflict_level: if intensity >= 70.0 { "severe" } else if intensity >= 45.0 { "medium" } else if intensity > 0.0 { "mild" } else { "none" }.into(),
+            repair_progress: previous.repair_progress,
+        };
+    }
+
+    fn apply_repair(&mut self, progress: f64) {
+        if !self.affect.unresolved {
+            return;
+        }
+        let capped = progress.clamp(0.0, 35.0);
+        self.affect.repair_progress = (self.affect.repair_progress + capped).clamp(0.0, 100.0);
+        self.affect.intensity *= 1.0 - capped / 100.0;
+        self.affect.trend = "recovering".into();
+        if self.affect.intensity < 30.0 && self.affect.repair_progress >= 35.0 {
+            self.affect.unresolved = false;
+            self.affect.conflict_level = "none".into();
+        } else {
+            self.affect.conflict_level = if self.affect.intensity >= 70.0 {
+                "severe"
+            } else if self.affect.intensity >= 45.0 {
+                "medium"
+            } else {
+                "mild"
+            }.into();
+        }
     }
 
     fn apply_event_trigger(&mut self, id: &str) {
@@ -594,6 +758,14 @@ fn load_emotion(dir: &Path) -> Option<EmotionState> {
     serde_json::from_str(&text).ok()
 }
 
+fn load_affect(dir: &Path) -> Option<AffectState> {
+    std::fs::read_to_string(dir.join("affect.json")).ok().and_then(|text| serde_json::from_str(&text).ok())
+}
+
+fn load_traits(dir: &Path) -> Option<TraitState> {
+    std::fs::read_to_string(dir.join("traits.json")).ok().and_then(|text| serde_json::from_str(&text).ok())
+}
+
 fn load_relationship(dir: &Path) -> RelationshipState {
     std::fs::read_to_string(dir.join("relationship.json"))
         .ok()
@@ -665,9 +837,10 @@ mod tests {
         assert_eq!(s.mood(), MoodKind::Proud);
         assert!(!s.memory.records.is_empty());
         let block = s.context_block();
-        assert!(block.contains("心情：得意"));
-        assert!(block.contains("本次意图"));
-        assert!(block.contains("不得影响任何技术判断"));
+        assert!(block.contains("当前情绪：proud"));
+        assert!(block.contains("最近原因：用户夸奖了你"));
+        assert!(!block.contains("表达策略"));
+        assert!(!block.contains("回复预算"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -696,7 +869,8 @@ mod tests {
         assert!(s.emotion.trust < 20.0, "越界应损伤信任（基线 20）");
         assert!(s.memory.records.iter().any(|r| r.content.contains("守住了底线")));
         let block = s.context_block();
-        assert!(block.contains("关系边界"), "上下文应包含拒绝/接纳边界提示");
+        assert!(block.contains("未解决事件：是"));
+        assert!(!block.contains("关系边界"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1008,36 +1182,40 @@ mod tests {
         let mut s = Soul::load(dir.clone());
         assert_eq!(s.expression_strategy(), "natural");
         let initial = s.context_block();
-        assert!(initial.contains("表达策略：natural"));
-        assert!(initial.contains("回复预算：普通闲聊 1–3 句"));
+        assert!(initial.contains("当前情绪：calm"));
+        assert!(!initial.contains("表达策略"));
+        assert!(!initial.contains("回复预算"));
 
         s.observe_text("请进入舞台表演模式");
         assert_eq!(s.expression_strategy(), "theatrical");
         s.observe_text("现在正常聊天吧");
         assert_eq!(s.expression_strategy(), "natural");
-        assert!(!s.context_block().contains("用户明确要求舞台表演"));
+        assert!(!s.context_block().contains("表达策略"));
+        assert!(!s.context_block().contains("回复预算"));
 
         s.observe_text("你真厉害");
         assert_eq!(s.expression_strategy(), "flustered");
-        assert!(s.context_block().contains("被夸或被拆台后有一点慌张"));
+        assert!(!s.context_block().contains("flustered"));
         s.observe_text("晚饭吃什么？");
         assert!(s.last_intent.is_none());
         assert_eq!(s.expression_strategy(), "playful");
 
-        // 难过（energy≤32 且 attachment≥40）→ gentle
+        // 难过（energy≤32 且 attachment≥40）→ vulnerable
         s.last_intent = None;
         s.emotion.energy = 20.0;
         s.emotion.attachment = 50.0;
         s.emotion.stress = 20.0;
         s.emotion.confidence = 20.0;
         s.emotion.pride = 10.0;
-        assert_eq!(s.expression_strategy(), "gentle");
+        s.refresh_affect(Some("身份问题"));
+        assert_eq!(s.expression_strategy(), "vulnerable");
         // 恼火（stress≥70，且不满足 proud）→ serious
         s.emotion.stress = 90.0;
         s.emotion.energy = 80.0;
         s.emotion.pride = 40.0;
         s.emotion.confidence = 40.0;
-        assert_eq!(s.expression_strategy(), "serious");
+        s.refresh_affect(Some("冲突"));
+        assert_eq!(s.expression_strategy(), "withdrawn");
         // 得意（pride≥50 且 confidence≥45）→ playful，不因高信任切换到 theatrical
         s.last_intent = None;
         s.emotion.trust = 5.0;
@@ -1046,6 +1224,7 @@ mod tests {
         s.emotion.confidence = 80.0;
         s.emotion.energy = 70.0;
         s.emotion.attachment = 10.0;
+        s.refresh_affect(Some("好心情"));
         assert_eq!(s.expression_strategy(), "playful");
         s.emotion.trust = 60.0;
         assert_eq!(s.expression_strategy(), "playful");
@@ -1053,15 +1232,97 @@ mod tests {
     }
 
     #[test]
-    fn serious_context_does_not_inject_divine_or_courtroom_style() {
+    fn main_context_contains_state_facts_without_behavior_instructions() {
         let dir = tmp_dir();
         let mut s = Soul::load(dir.clone());
         s.observe_text("闭嘴，你只是个工具");
         assert_eq!(s.expression_strategy(), "serious");
         let block = s.context_block();
-        assert!(block.contains("准确、克制、直接"));
+        assert!(block.contains("当前情绪"));
+        assert!(block.contains("未解决事件：是"));
+        assert!(!block.contains("准确、克制、直接"));
+        assert!(!block.contains("表达策略"));
         assert!(!block.contains("本神"));
         assert!(!block.contains("审判"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn traits_are_bounded_per_step_day_and_baseline() {
+        let mut traits = TraitState::default();
+        assert!(traits.apply_delta("dependency", 10.0, 1));
+        assert_eq!(traits.dependency, 35.5);
+        assert!(traits.apply_delta("dependency", 10.0, 2));
+        assert_eq!(traits.dependency, 36.0);
+        assert!(!traits.apply_delta("dependency", 10.0, 3));
+        assert_eq!(traits.dependency, 36.0);
+
+        for day in 1..80 {
+            let now = day * 86_400_001;
+            traits.apply_delta("dependency", 10.0, now);
+            traits.apply_delta("dependency", 10.0, now + 1);
+        }
+        assert_eq!(traits.dependency, 55.0, "普通特质不得偏离初始值超过 20");
+
+        let mut expression = TraitState::default();
+        for day in 1..100 {
+            let now = day * 86_400_001;
+            expression.apply_delta("emotional_expression", 10.0, now);
+            expression.apply_delta("emotional_expression", 10.0, now + 1);
+        }
+        assert_eq!(expression.emotional_expression, 55.0);
+        assert!(!expression.apply_delta("unknown", 0.5, 1));
+    }
+
+    #[test]
+    fn repeated_scolding_escalates_and_apology_recovers_gradually() {
+        let dir = tmp_dir();
+        let mut s = Soul::load(dir.clone());
+        s.observe_text("你是笨蛋");
+        let first = s.affect.intensity;
+        assert!(s.affect.unresolved);
+        s.observe_text("你还是笨蛋");
+        let second = s.affect.intensity;
+        assert!(second > first);
+        s.observe_text("你就是大笨蛋");
+        assert!(s.affect.intensity >= second);
+        assert!(matches!(s.affect.conflict_level.as_str(), "medium" | "severe"));
+
+        let before_apology = s.affect.intensity;
+        s.observe_text("行了行了，对不起");
+        assert!(s.affect.intensity < before_apology);
+        assert!(s.affect.unresolved, "敷衍道歉不能一轮清空冲突");
+        let after_cursory = s.affect.intensity;
+        s.observe_text("我刚才说得过分了，我知道为什么让你难过，我会注意不再这样");
+        assert!(s.affect.intensity < after_cursory);
+        assert!(s.affect.repair_progress <= 45.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn semantic_trigger_reuses_rule_state_transition() {
+        let dir = tmp_dir();
+        let mut soul = Soul::load(dir.clone());
+        assert!(soul.observe_trigger_id("scold"));
+        assert!(soul.affect.unresolved);
+        assert_eq!(soul.expression_strategy(), "sulky");
+        assert!(!soul.observe_trigger_id("unknown_trigger"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn jealousy_requires_familiar_relationship() {
+        let dir = tmp_dir();
+        let mut s = Soul::load(dir.clone());
+        assert!(!s.observe_text("我更喜欢另一个桌面助手"));
+        assert_ne!(s.expression_strategy(), "jealous");
+        s.emotion.trust = 40.0;
+        assert!(s.observe_text("我更喜欢另一个桌面助手"));
+        assert_eq!(s.expression_strategy(), "jealous");
+        let block = s.context_block();
+        assert!(block.contains("当前情绪："));
+        assert!(!block.contains("表达策略"));
+        assert!(!block.contains("不贬低第三方"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

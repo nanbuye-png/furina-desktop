@@ -2,8 +2,9 @@
 //! with hard stop conditions and a structured event stream.
 
 use crate::config::Config;
-use crate::context::{truncate_text, trim_incomplete_turn, ContextManager};
+use crate::context::{strip_runtime_soul_context, truncate_text, trim_incomplete_turn, ContextManager};
 use crate::gateway::{escapes_workspace, is_private_path, ActionKind, PermissionGateway, Verdict};
+use crate::interaction::{analyze_with_fallback, InteractionAnalyzer};
 use crate::llm::LlmClient;
 use crate::sidecar::Sidecar;
 use crate::state::AgentState;
@@ -26,10 +27,88 @@ pub trait Approver: Send {
 pub trait PromptContextProvider: Send + Sync {
     /// 用户在本次回合的输入（用于更新情绪/关系）。
     fn observe_user_text(&self, text: &str);
+    /// 已验证的轻量语义分类结果；默认实现保持旧行为兼容。
+    fn observe_trigger_id(&self, _trigger_id: &str) {}
     /// 运行时事件（工具调用/验证/审批/完成等），用于驱动情绪与记忆。
     fn observe_event(&self, event: &Event);
     /// 返回动态人格注入块；空字符串表示无需注入。
     fn context_block(&self) -> String;
+    /// 返回指定运行模式的人格上下文。默认兼容旧实现。
+    fn context_block_for(&self, _mode: &str) -> String {
+        self.context_block()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractionMode {
+    Chat,
+    Agent,
+}
+
+impl InteractionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Agent => "agent",
+        }
+    }
+}
+
+fn classify_interaction_mode(text: &str) -> InteractionMode {
+    let lower = text.to_lowercase();
+    const TECHNICAL_MARKERS: &[&str] = &[
+        "代码", "编程", "函数", "报错", "错误", "异常", "测试", "构建", "编译", "项目",
+        "文件", "目录", "路径", "配置", "命令", "终端", "脚本", "仓库", "git", "github",
+        "依赖", "安装", "接口", "api", "数据库", "日志", "读取", "写入", "修改", "修复",
+        "删除", "提交", "推送", "权限", "workspace", "rust", "python", "javascript", "typescript",
+        "react", "tauri", "cargo", "npm", "yaml", "json", "toml", "exe", "vrm", "sidecar",
+    ];
+    let has_path_or_code = lower.contains("```")
+        || lower.contains("\\")
+        || lower.contains("/src/")
+        || [".rs", ".py", ".js", ".jsx", ".ts", ".tsx", ".yaml", ".yml", ".json", ".toml", ".md"]
+            .iter()
+            .any(|extension| lower.contains(extension));
+    if has_path_or_code || TECHNICAL_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        InteractionMode::Agent
+    } else {
+        InteractionMode::Chat
+    }
+}
+
+fn dialogue_text(content: &str) -> String {
+    let content = content
+        .strip_prefix("任务：")
+        .or_else(|| content.strip_prefix("新任务："))
+        .unwrap_or(content);
+    strip_runtime_soul_context(content)
+}
+
+fn append_current_context(messages: &mut [ChatMessage], context: &str) {
+    if context.is_empty() {
+        return;
+    }
+    if let Some(ChatMessage::System { content }) = messages.first_mut() {
+        content.push_str("\n\n");
+        content.push_str(context);
+    }
+}
+
+fn recent_dialogue(transcript: &[ChatMessage], max_messages: usize) -> Vec<(String, String)> {
+    let mut messages = transcript
+        .iter()
+        .filter_map(|message| match message {
+            ChatMessage::User { content } => Some(("user".to_string(), dialogue_text(content))),
+            ChatMessage::Assistant { content: Some(content), tool_calls: None } => {
+                Some(("assistant".to_string(), dialogue_text(content)))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if messages.len() > max_messages {
+        messages.drain(..messages.len() - max_messages);
+    }
+    messages
 }
 
 pub struct Agent {
@@ -41,6 +120,8 @@ pub struct Agent {
     events: Arc<dyn crate::sidecar::EventSink>,
     approver: Box<dyn Approver>,
     prompt_context: Option<Box<dyn PromptContextProvider>>,
+    interaction_analyzer: Option<Box<dyn InteractionAnalyzer>>,
+    interaction_analyzer_timeout_ms: u64,
     system_prompt: String,
     gateway: PermissionGateway,
     /// Soul 私有/运行时配置目录（绝对路径）：工具一律禁止读写。
@@ -94,6 +175,8 @@ impl Agent {
             events,
             approver,
             prompt_context: None,
+            interaction_analyzer: None,
+            interaction_analyzer_timeout_ms: 1500,
             system_prompt,
             gateway,
             private_paths: Vec::new(),
@@ -135,6 +218,15 @@ impl Agent {
         self.prompt_context = Some(provider);
     }
 
+    pub fn set_interaction_analyzer(
+        &mut self,
+        analyzer: Box<dyn InteractionAnalyzer>,
+        timeout_ms: u64,
+    ) {
+        self.interaction_analyzer = Some(analyzer);
+        self.interaction_analyzer_timeout_ms = timeout_ms.clamp(500, 1500);
+    }
+
     /// 注入网页缓存（Web Intelligence Phase 2）：web.open / web.search 成功后自动落盘。
     pub fn set_web_cache(&mut self, cache: WebCache) {
         self.web_cache = Some(cache);
@@ -154,17 +246,30 @@ impl Agent {
     pub async fn run_task(&mut self, task: &str) -> anyhow::Result<TaskOutcome> {
         // 丢弃上一轮被中断留下的未完成回合，保证发给 LLM 的消息序列合法。
         trim_incomplete_turn(&mut self.transcript);
-        // 人格层先观察用户输入，再生成动态注入块。
-        if let Some(p) = &self.prompt_context {
-            p.observe_user_text(task);
+        let interaction_mode = classify_interaction_mode(task);
+        let semantic_analysis = if interaction_mode == InteractionMode::Chat {
+            if let Some(analyzer) = self.interaction_analyzer.as_deref() {
+                let recent_dialogue = recent_dialogue(&self.transcript, 4);
+                analyze_with_fallback(
+                    analyzer,
+                    task,
+                    &recent_dialogue,
+                    self.interaction_analyzer_timeout_ms,
+                )
+                .await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(provider) = &self.prompt_context {
+            if let Some(analysis) = semantic_analysis.as_ref() {
+                provider.observe_trigger_id(analysis.accepted_trigger().unwrap_or(""));
+            } else {
+                provider.observe_user_text(task);
+            }
         }
-        let context_line = self
-            .prompt_context
-            .as_ref()
-            .map(|p| p.context_block())
-            .filter(|s| !s.is_empty())
-            .map(|c| format!("\n\n{c}"))
-            .unwrap_or_default();
         self.state = AgentState::Planning;
         self.emit_state();
         self.emit(Event::SessionStarted {
@@ -174,9 +279,9 @@ impl Agent {
 
         if self.transcript.is_empty() {
             self.transcript.push(ChatMessage::System { content: self.system_prompt.clone() });
-            self.transcript.push(ChatMessage::User { content: format!("任务：{task}{context_line}") });
+            self.transcript.push(ChatMessage::User { content: format!("任务：{task}") });
         } else {
-            self.transcript.push(ChatMessage::User { content: format!("新任务：{task}{context_line}") });
+            self.transcript.push(ChatMessage::User { content: format!("新任务：{task}") });
         }
 
         let tools = self.llm_tools();
@@ -190,7 +295,14 @@ impl Agent {
                 return self.finish(false, format!("超过 token 预算（{}）", self.cfg.llm.max_total_tokens)).await;
             }
 
-            let messages = self.context.fit(&self.transcript);
+            let current_context = self
+                .prompt_context
+                .as_ref()
+                .map(|p| p.context_block_for(interaction_mode.as_str()))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_default();
+            let mut messages = self.context.fit(&self.transcript);
+            append_current_context(&mut messages, &current_context);
             // 流式 LLM：增量文本实时发射 MessageDelta（UI 打字机 + 逐句语音），
             // 完整内容仍在返回后写入转录（上下文/记忆/日志语义不变）。
             let events = self.events.clone();
@@ -752,6 +864,24 @@ fn external_change_warning(known: Option<&str>, current: Option<&str>) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recent_dialogue_excludes_tools_and_runtime_soul_context() {
+        let transcript = vec![
+            ChatMessage::User { content: "任务：你是笨蛋\n\n[当前灵魂状态]\n表达策略：sulky".into() },
+            ChatMessage::Tool { tool_call_id: "call_1".into(), content: "secret tool result".into() },
+            ChatMessage::Assistant { content: Some("才不是。".into()), tool_calls: None },
+        ];
+        assert_eq!(recent_dialogue(&transcript, 4), vec![("user".into(), "你是笨蛋".into()), ("assistant".into(), "才不是。".into())]);
+    }
+
+    #[test]
+    fn interaction_mode_separates_chat_from_agent_work() {
+        assert_eq!(classify_interaction_mode("早上好，芙芙"), InteractionMode::Chat);
+        assert_eq!(classify_interaction_mode("你真可爱"), InteractionMode::Chat);
+        assert_eq!(classify_interaction_mode("帮我修复这段 Rust 代码"), InteractionMode::Agent);
+        assert_eq!(classify_interaction_mode(r"读取 D:\project\demo\src\main.rs"), InteractionMode::Agent);
+    }
 
     #[test]
     fn external_change_warns_when_hash_differs() {

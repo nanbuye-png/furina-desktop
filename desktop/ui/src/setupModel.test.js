@@ -10,10 +10,26 @@ describe("setup model", () => {
     });
   });
 
-  it("defaults optional voice services to disabled", () => {
+  it("defaults optional voice services and classifier to disabled", () => {
     const form = createInitialSetupForm({ runtime: { workspace_root: "D:/workspace" } });
     expect(form.voiceEnabled).toBe(false);
     expect(form.asrEnabled).toBe(false);
+    expect(form.emotionClassifierEnabled).toBe(false);
+    expect(form.emotionClassifierTimeoutMs).toBe(1500);
+  });
+
+  it("restores and validates emotion classifier advanced settings", () => {
+    const form = createInitialSetupForm({
+      runtime: { workspace_root: "D:/workspace" },
+      llm: { apiKeyConfigured: true, model: "main-model" },
+      emotionClassifier: { enabled: true, providerId: "desktop", model: "small-model", timeoutMs: 1200, maxTokens: 128 },
+    });
+    expect(form.emotionClassifierModel).toBe("small-model");
+    expect(validateSetupForm(form, { llm: { apiKeyConfigured: true } })).toBeNull();
+    expect(validateSetupForm({ ...form, emotionClassifierTimeoutMs: 2000 }, { llm: { apiKeyConfigured: true } })).toEqual({
+      step: 1,
+      message: "情绪分类器超时必须在 500–1500ms 之间。",
+    });
   });
 
   it("restores independent custom TTS and ASR settings", () => {

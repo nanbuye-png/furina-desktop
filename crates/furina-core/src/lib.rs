@@ -8,6 +8,7 @@ pub mod config;
 pub mod context;
 pub mod gateway;
 pub mod interject;
+pub mod interaction;
 pub mod llm;
 pub mod proxy;
 pub mod sidecar;

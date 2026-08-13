@@ -280,7 +280,7 @@ mod tests {
     fn expression_strategy_configs_are_complete_and_unique() {
         let cfg = load();
         let strategies = &cfg.behavior_rules.expression_strategies;
-        let expected = ["natural", "playful", "flustered", "gentle", "serious", "theatrical"];
+        let expected = ["natural", "playful", "flustered", "sulky", "guarded", "withdrawn", "vulnerable", "uncertain", "jealous", "gentle", "serious", "theatrical"];
         for id in expected {
             assert!(strategies.iter().any(|strategy| strategy.id == id), "缺少表达策略 {id}");
             assert!(cfg.personality.expression_styles.contains_key(id), "缺少 {id} 风格说明");

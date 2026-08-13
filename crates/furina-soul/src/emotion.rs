@@ -6,6 +6,40 @@ use std::collections::HashMap;
 
 const DIMS: [&str; 6] = ["confidence", "trust", "attachment", "energy", "stress", "pride"];
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AffectState {
+    pub primary: String,
+    pub secondary: Option<String>,
+    pub intensity: f64,
+    pub trigger: String,
+    pub started_at: u128,
+    pub updated_at: u128,
+    pub recover_after: u128,
+    pub trend: String,
+    pub unresolved: bool,
+    pub conflict_level: String,
+    pub repair_progress: f64,
+}
+
+impl Default for AffectState {
+    fn default() -> Self {
+        Self {
+            primary: "calm".into(),
+            secondary: None,
+            intensity: 0.0,
+            trigger: String::new(),
+            started_at: 0,
+            updated_at: 0,
+            recover_after: 0,
+            trend: "stable".into(),
+            unresolved: false,
+            conflict_level: "none".into(),
+            repair_progress: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmotionState {
     pub confidence: f64,

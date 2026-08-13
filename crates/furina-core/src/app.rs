@@ -5,6 +5,7 @@
 
 use crate::agent::{Agent, Approver, PromptContextProvider};
 use crate::config::Config;
+use crate::interaction::HttpInteractionAnalyzer;
 use crate::llm::{DeepSeekClient, LlmClient};
 use crate::sidecar::{EventSink, Sidecar, SidecarLaunch};
 use crate::web_cache::WebCache;
@@ -151,6 +152,20 @@ pub fn find_python() -> String {
 
 
 /// 按提供方配置构造 OpenAI 兼容客户端（key 从环境变量读取）。
+pub fn build_interaction_analyzer(cfg: &Config) -> anyhow::Result<Option<HttpInteractionAnalyzer>> {
+    let classifier = &cfg.emotion_classifier;
+    if !classifier.enabled {
+        return Ok(None);
+    }
+    let provider = cfg
+        .provider(classifier.provider_id.trim())
+        .ok_or_else(|| anyhow::anyhow!("未找到情绪分类器提供方: {}", classifier.provider_id))?;
+    let key = env::var(&provider.api_key_env).map_err(|_| {
+        anyhow::anyhow!("情绪分类器缺少环境变量 {}", provider.api_key_env)
+    })?;
+    HttpInteractionAnalyzer::new(provider, key, classifier).map(Some)
+}
+
 pub fn build_llm(cfg: &Config) -> anyhow::Result<Box<dyn LlmClient>> {
     let provider = cfg.active_provider()?;
     let key = env::var(&provider.api_key_env).map_err(|_| {
@@ -183,7 +198,7 @@ pub fn build_system_prompt(root: &Path, persona: &str) -> anyhow::Result<String>
     let persona_path = root.join("persona").join(format!("{persona}.yaml"));
     let meta: PersonaMeta = serde_yaml::from_str(&std::fs::read_to_string(&persona_path)?)?;
     if meta.persona_version >= 2 && meta.dialogue_style.trim().is_empty() {
-        anyhow::bail!("persona v2 缺少 dialogue_style：{}", persona_path.display());
+        anyhow::bail!("persona v3 缺少 dialogue_style：{}", persona_path.display());
     }
     let prompt = std::fs::read_to_string(root.join("persona/system_prompt.md"))?;
     Ok(prompt.replace("{persona_style}", &meta.dialogue_style))
@@ -201,8 +216,16 @@ impl PromptContextProvider for SoulProvider {
         self.0.lock().unwrap().observe_event(event);
     }
 
+    fn observe_trigger_id(&self, trigger_id: &str) {
+        self.0.lock().unwrap().observe_trigger_id(trigger_id);
+    }
+
     fn context_block(&self) -> String {
         self.0.lock().unwrap().context_block()
+    }
+
+    fn context_block_for(&self, mode: &str) -> String {
+        self.0.lock().unwrap().context_block_for(mode)
     }
 }
 
@@ -217,6 +240,8 @@ pub async fn build_agent(
     let cfg = Config::load(&paths.config_path())?;
     let system_prompt = build_system_prompt(&paths.resource_root, persona)?;
     let llm = build_llm(&cfg)?;
+    let interaction_analyzer = build_interaction_analyzer(&cfg).ok().flatten();
+    let interaction_analyzer_timeout_ms = cfg.emotion_classifier.timeout_ms;
     let sidecar = Sidecar::spawn(
         &paths.sidecar,
         &paths.workspace_root.display().to_string(),
@@ -235,6 +260,9 @@ pub async fn build_agent(
     // Soul 私有边界：人格配置 / 记忆 / 密钥目录对 LLM 工具不可读写。
     agent.set_private_paths(vec![paths.resource_root.join("persona"), paths.data_root.join(".furina")]);
     agent.set_prompt_context(Box::new(SoulProvider(soul)));
+    if let Some(interaction_analyzer) = interaction_analyzer {
+        agent.set_interaction_analyzer(Box::new(interaction_analyzer), interaction_analyzer_timeout_ms);
+    }
     agent.set_web_cache(WebCache::open(&paths.web_cache_dir()));
     Ok(agent)
 }
@@ -266,16 +294,18 @@ mod tests {
     }
 
     #[test]
-    fn persona_v2_prompt_contains_reality_and_length_rules() {
+    fn persona_v3_prompt_contains_reality_length_and_task_safety_rules() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let text = std::fs::read_to_string(root.join("persona/furina.yaml")).unwrap();
         let meta: PersonaMeta = serde_yaml::from_str(&text).unwrap();
-        assert_eq!(meta.persona_version, 2);
+        assert_eq!(meta.persona_version, 3);
 
         let prompt = build_system_prompt(&root, "furina").unwrap();
-        assert!(prompt.contains("当前环境是现实世界，不是提瓦特"));
-        assert!(prompt.contains("普通闲聊默认 1–3 句"));
-        assert!(prompt.contains("不得声称看见用户、桌面物品或房间"));
+        assert!(prompt.contains("清楚当前身处现实世界"));
+        assert!(prompt.contains("普通交流通常简洁"));
+        assert!(prompt.contains("没有可靠输入时，我不会声称看见、触碰或闻到现实事物"));
+        assert!(prompt.contains("技术任务必须事实准确、参数准确、结果可核验"));
+        assert!(prompt.contains("删除、批量删除、递归删除、清空目录和破坏性覆盖始终禁止"));
         assert!(!prompt.contains("喜欢把对话当演出"));
     }
 }
