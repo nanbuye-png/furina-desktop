@@ -126,7 +126,11 @@ body {
   position: absolute;
   inset: 0;
   z-index: 1;
+  cursor: default;
+  touch-action: none;
+  user-select: none;
 }
+.avatar-stage-ready .avatar-viewport { cursor: pointer; }
 .avatar-canvas {
   display: block;
   width: 100%;
@@ -196,6 +200,7 @@ body {
   font-size: 10px;
   letter-spacing: 1.4px;
   backdrop-filter: blur(8px);
+  pointer-events: none;
 }
 .avatar-status-dot {
   width: 6px;

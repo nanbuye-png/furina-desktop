@@ -9,6 +9,7 @@ const ALLOWED_TRIGGERS: &[&str] = &[
     "loneliness_question",
     "jealousy_cue",
     "praise",
+    "tease",
     "scold",
     "confide",
     "sad",
@@ -39,6 +40,9 @@ impl InteractionAnalysis {
     pub fn accepted_trigger(&self) -> Option<&str> {
         if self.confidence < 0.6 {
             return None;
+        }
+        if self.tease && !self.insult && self.severity <= 1 {
+            return Some("tease");
         }
         self.trigger_id
             .as_deref()
@@ -104,7 +108,7 @@ impl HttpInteractionAnalyzer {
         serde_json::json!([
             {
                 "role": "system",
-                "content": "你是 Furina Desktop 的轻量交互分类器，只分析用户语气，不生成角色台词。只输出一个 JSON 对象，不要 Markdown。字段：interaction_type、intent_category、trigger_id、tease、insult、apology、closeness、denial、jealousy、severity、confidence。trigger_id 只能是 theatrical_request、identity_question、loneliness_question、jealousy_cue、praise、scold、confide、sad、happy、annoyed、user_demeaning、sincere_apology、cursory_apology 或 null。severity 为 0 到 3，confidence 为 0 到 1。区分轻松调侃与真实羞辱，区分敷衍道歉与真诚道歉。"
+                "content": "你是 Furina Desktop 的轻量交互分类器，只分析用户语气，不生成角色台词。只输出一个 JSON 对象，不要 Markdown。字段：interaction_type、intent_category、trigger_id、tease、insult、apology、closeness、denial、jealousy、severity、confidence。trigger_id 只能是 theatrical_request、identity_question、loneliness_question、jealousy_cue、praise、tease、scold、confide、sad、happy、annoyed、user_demeaning、sincere_apology、cursory_apology 或 null。severity 为 0 到 3，confidence 为 0 到 1。亲昵称呼、熟人斗嘴或轻微打趣应标记 tease=true、insult=false、severity 0 或 1，并优先使用 tease；真实贬低、羞辱或命令式攻击才使用 scold 或 user_demeaning。区分敷衍道歉与真诚道歉。"
             },
             {
                 "role": "user",
@@ -206,8 +210,17 @@ mod tests {
         let analysis = parse_analysis(r#"```json
 {"interaction_type":"tease","intent_category":"social","trigger_id":"scold","tease":true,"severity":1,"confidence":0.91}
 ```"#).unwrap();
-        assert_eq!(analysis.accepted_trigger(), Some("scold"));
+        assert_eq!(analysis.accepted_trigger(), Some("tease"));
         assert!(analysis.tease);
+    }
+
+    #[test]
+    fn real_insult_is_not_overridden_by_tease_flag() {
+        let analysis = parse_analysis(
+            r#"{"trigger_id":"user_demeaning","tease":true,"insult":true,"severity":3,"confidence":0.95}"#,
+        )
+        .unwrap();
+        assert_eq!(analysis.accepted_trigger(), Some("user_demeaning"));
     }
 
     #[test]

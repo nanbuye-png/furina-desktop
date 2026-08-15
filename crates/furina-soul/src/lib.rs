@@ -5,21 +5,24 @@
 
 mod config;
 mod emotion;
+mod emotion_event;
 mod memory;
 mod proactive;
 mod relationship;
 
 use config::{detect_text_trigger, SoulConfig, StageConfig};
 use furina_proto::Event;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use config::MoodKind;
 pub use emotion::{AffectState, EmotionState};
+pub use emotion_event::{EmotionEvent, MAX_EMOTION_EVENTS};
 pub use memory::MemoryRecord;
 pub use memory::MemoryDraft;
 pub use memory::MemoryStore;
+pub use memory::EmotionalMemoryContext;
 pub use proactive::ProactiveEvent;
 pub use relationship::RelationshipState;
 pub use relationship::RelationEvent;
@@ -138,6 +141,7 @@ pub struct Soul {
     pub traits: TraitState,
     pub relationship: RelationshipState,
     pub memory: MemoryStore,
+    pub emotion_events: VecDeque<EmotionEvent>,
     pub last_intent: Option<IntentInfo>,
     pub last_interaction_ms: Option<u128>,
     proactive_fired: HashMap<String, u128>,
@@ -162,6 +166,7 @@ impl Soul {
         let traits = load_traits(&dir).unwrap_or_default();
         let relationship = load_relationship(&dir);
         let memory = MemoryStore::load(&dir);
+        let emotion_events = load_emotion_events(&dir);
         let meta = load_meta(&dir);
         Self {
             cfg,
@@ -170,6 +175,7 @@ impl Soul {
             traits,
             relationship,
             memory,
+            emotion_events,
             last_intent: None,
             last_interaction_ms: meta.last_interaction_ms,
             proactive_fired: meta.proactive_fired,
@@ -190,6 +196,54 @@ impl Soul {
 
     pub fn stage(&self) -> StageConfig {
         self.relationship.stage(&self.cfg.relationship_model, self.emotion.trust)
+    }
+
+    /// 将自然衰减应用到当前状态，并同步 affect；不会制造新的情绪事件。
+    pub fn advance_time(&mut self, now: u128) {
+        let previous = self.emotion.clone();
+        self.emotion = self.emotion.decayed(&self.cfg.emotion_model, now);
+        if previous.updated_ms != self.emotion.updated_ms
+            || ["confidence", "trust", "attachment", "energy", "stress", "pride"]
+                .iter()
+                .any(|dimension| (previous.get(dimension) - self.emotion.get(dimension)).abs() >= 0.01)
+        {
+            self.refresh_affect(None);
+            self.dirty = true;
+        }
+    }
+
+    pub fn recent_emotion_events(&self, k: usize) -> Vec<&EmotionEvent> {
+        self.emotion_events
+            .iter()
+            .rev()
+            .filter(|event| event.important)
+            .take(k)
+            .collect()
+    }
+
+    pub fn recent_emotional_memories(&self, k: usize) -> Vec<&MemoryRecord> {
+        let trigger_id = self
+            .emotion_events
+            .iter()
+            .rev()
+            .find_map(|event| event.trigger_id.as_deref());
+        self.memory.top_emotional_k(
+            now_ms(),
+            self.mood(),
+            trigger_id,
+            &self.cfg.memory_scoring,
+            k,
+        )
+    }
+
+    pub fn recent_semantic_memories(&self, k: usize) -> Vec<&MemoryRecord> {
+        self.memory.top_kind_k(
+            now_ms(),
+            self.mood(),
+            &self.cfg.memory_scoring,
+            "semantic",
+            k,
+        )
     }
 
     /// 选择当前表达策略。策略只改变闲聊表现，不改变事实、权限或工具行为。
@@ -241,6 +295,9 @@ impl Soul {
     }
 
     fn observe_trigger(&mut self, trigger_id: Option<&str>) -> bool {
+        self.advance_time(now_ms());
+        let before_emotion = self.emotion.clone();
+        let before_affect = self.affect.clone();
         self.last_interaction_ms = Some(now_ms());
         self.relationship.interaction_count += 1;
         let Some(t) = trigger_id.and_then(|id| {
@@ -248,19 +305,58 @@ impl Soul {
         }) else {
             self.last_intent = None;
             self.refresh_affect(None);
+            self.record_emotion_event(
+                "text",
+                trigger_id.map(str::to_string),
+                "普通互动",
+                &before_emotion,
+                &before_affect,
+                0,
+                0,
+                "",
+            );
             self.dirty = true;
             return false;
         };
         let trigger_id = t.id.clone();
         let trigger_cause = t.cause.clone();
-        let trigger_intent = t.intent.clone();
+        let mut trigger_intent = t.intent.clone();
         let trigger_value = t.value.clone();
-        let trigger_deltas = t.deltas.clone();
-        if trigger_id == "jealousy_cue" && !matches!(self.stage().id.as_str(), "familiar" | "trusted" | "partner") {
+        let mut trigger_deltas = t.deltas.clone();
+        if trigger_id == "jealousy_cue"
+            && !matches!(self.stage().id.as_str(), "familiar" | "trusted" | "partner")
+        {
             self.last_intent = None;
             self.refresh_affect(None);
+            self.record_emotion_event(
+                "text",
+                Some(trigger_id),
+                &trigger_cause,
+                &before_emotion,
+                &before_affect,
+                0,
+                0,
+                "",
+            );
             self.dirty = true;
             return false;
+        }
+        if trigger_id == "tease" {
+            match self.stage().id.as_str() {
+                "familiar" => {
+                    trigger_deltas.insert("attachment".into(), 1.0);
+                    trigger_deltas.insert("trust".into(), 0.5);
+                    trigger_intent = "banter_playfully".into();
+                }
+                "trusted" | "partner" => {
+                    trigger_deltas.insert("attachment".into(), 1.5);
+                    trigger_deltas.insert("trust".into(), 1.0);
+                    trigger_intent = "banter_affectionately".into();
+                }
+                _ => {
+                    trigger_intent = "acknowledge_tease_without_overfamiliarity".into();
+                }
+            }
         }
         match trigger_id.as_str() {
             "praise" => self.relationship.praise_count += 1,
@@ -271,6 +367,7 @@ impl Soul {
         self.emotion.apply_deltas(&trigger_deltas);
         let log_text = match trigger_id.as_str() {
             "praise" => "被夸奖：心情转好，信任提升",
+            "tease" => "被亲昵调侃：按当前关系自然回应，没有把玩笑当成数落",
             "scold" => "被数落：有点委屈，信任微降",
             "user_demeaning" => "被羞辱/强迫：守住底线，信任明显下降",
             "sincere_apology" => "用户认真解释并道歉：关系开始修复",
@@ -294,6 +391,7 @@ impl Soul {
         });
         let (importance, valence, note) = match trigger_id.as_str() {
             "praise" => (60, 1i8, "（当时嘴上得意，心里其实很开心）"),
+            "tease" => (30, 1i8, "（只是自然的亲昵玩笑）"),
             "scold" => (65, -1i8, "（有点委屈，这件事还需要时间消化）"),
             "confide" => (70, 0i8, "（我认真听了）"),
             "sad" => (55, -1i8, "（我想认真安慰她）"),
@@ -307,15 +405,6 @@ impl Soul {
             "jealousy_cue" => (55, -1i8, "（有点吃味，但不会要求用户排斥别人）"),
             _ => (40, 0i8, ""),
         };
-        if trigger_id != "theatrical_request" {
-            self.memory.add_unique(
-                "emotional",
-                format!("{} {note}", trigger_cause),
-                importance,
-                valence,
-                vec![trigger_id.clone()],
-            );
-        }
         self.maybe_milestone();
         self.refresh_affect(Some(&trigger_cause));
         match trigger_id.as_str() {
@@ -327,10 +416,19 @@ impl Soul {
             "cursory_apology" => self.apply_repair(10.0),
             _ => {}
         }
+        self.record_emotion_event(
+            "text",
+            Some(trigger_id),
+            &trigger_cause,
+            &before_emotion,
+            &before_affect,
+            importance,
+            valence,
+            note,
+        );
         self.dirty = true;
         true
     }
-
     /// 事件流 → 情绪增量 + 行为意图 + 里程碑/事件记忆。
     pub fn observe_event(&mut self, event: &Event) {
         match event {
@@ -435,6 +533,16 @@ impl Soul {
         self.dirty = true;
     }
 
+    /// 从用户原文中提取明确表达的长期事实，不参与情绪状态转移。
+    pub fn observe_user_facts(&mut self, text: &str) -> bool {
+        let drafts = extract_user_fact_drafts(text);
+        if drafts.is_empty() {
+            return false;
+        }
+        self.add_memories(drafts);
+        true
+    }
+
     /// 清空所有记忆（关系/情绪状态保留）。
     pub fn clear_memories(&mut self) {
         self.memory.clear();
@@ -457,6 +565,82 @@ impl Soul {
         ok
     }
 
+    fn record_emotion_event(
+        &mut self,
+        source: &str,
+        trigger_id: Option<String>,
+        cause: &str,
+        before_emotion: &EmotionState,
+        before_affect: &AffectState,
+        importance: u8,
+        valence: i8,
+        note: &str,
+    ) {
+        let mood_before = before_emotion.mood(&self.cfg.emotion_model).as_str().to_string();
+        let mood_after = self.mood().as_str().to_string();
+        let mut deltas = HashMap::new();
+        for dimension in ["confidence", "trust", "attachment", "energy", "stress", "pride"] {
+            let delta = self.emotion.get(dimension) - before_emotion.get(dimension);
+            if delta.abs() >= 0.01 {
+                deltas.insert(dimension.to_string(), delta);
+            }
+        }
+        let delta_magnitude: f64 = deltas.values().map(|value| value.abs()).sum();
+        let mood_changed = mood_before != mood_after;
+        let affect_changed = (self.affect.intensity - before_affect.intensity).abs() >= 8.0
+            || self.affect.unresolved != before_affect.unresolved
+            || (self.affect.repair_progress - before_affect.repair_progress).abs() >= 10.0;
+        let important = importance >= 60 || mood_changed || delta_magnitude >= 8.0 || affect_changed;
+        let event = EmotionEvent {
+            timestamp: now_ms(),
+            source: source.into(),
+            trigger_id: trigger_id.clone(),
+            cause: cause.into(),
+            mood_before: mood_before.clone(),
+            mood_after: mood_after.clone(),
+            intensity_before: before_affect.intensity,
+            intensity_after: self.affect.intensity,
+            deltas: deltas.clone(),
+            trend: self.affect.trend.clone(),
+            unresolved: self.affect.unresolved,
+            important,
+        };
+        self.emotion_events.push_back(event);
+        while self.emotion_events.len() > MAX_EMOTION_EVENTS {
+            self.emotion_events.pop_front();
+        }
+        if important && source != "ordinary" {
+            let mut ordered_deltas: Vec<(String, f64)> = deltas.into_iter().collect();
+            ordered_deltas.sort_by(|a, b| a.0.cmp(&b.0));
+            let context = EmotionalMemoryContext {
+                mood: mood_after,
+                intensity: self.affect.intensity,
+                cause: cause.into(),
+                trigger_id,
+                mood_before,
+                mood_after: self.affect.primary.clone(),
+                intensity_before: before_affect.intensity,
+                intensity_after: self.affect.intensity,
+                trend: self.affect.trend.clone(),
+                unresolved: self.affect.unresolved,
+                deltas: ordered_deltas,
+            };
+            let content = if note.trim().is_empty() {
+                cause.to_string()
+            } else {
+                format!("{cause} {note}")
+            };
+            self.memory.add_emotional_unique(
+                content,
+                importance.max(60),
+                valence,
+                context.trigger_id.clone().into_iter().collect(),
+                context,
+            );
+        }
+        self.dirty = true;
+    }
+
     /// 动态人格注入块。只陈述当前状态事实，不规定本轮应采用的说话方式。
     pub fn context_block(&self) -> String {
         self.context_block_for("chat")
@@ -473,12 +657,51 @@ impl Soul {
         }
         let stage = self.stage();
         lines.push(format!("关系：{}（信任 {:.0}）", stage.label, self.emotion.trust));
+        lines.push("[当前关系表达]".into());
+        lines.push(format!("相处阶段：{}", stage.label));
+        if !stage.hint.trim().is_empty() {
+            lines.push(format!("表达倾向：{}", short(&stage.hint, 90)));
+        }
+        if !stage.acceptance.trim().is_empty() {
+            lines.push(format!("亲近许可：{}", short(&stage.acceptance, 90)));
+        }
+        if !stage.refusal.trim().is_empty() {
+            lines.push(format!("边界方式：{}", short(&stage.refusal, 90)));
+        }
+        lines.push("以上只调整自然表达、玩笑尺度与亲近程度，不覆盖人格、事实、安全边界或当前情绪。".into());
         if !self.affect.trigger.trim().is_empty() {
             lines.push(format!("最近原因：{}", short(&self.affect.trigger, 80)));
         }
+        let events = self.recent_emotion_events(3);
+        if !events.is_empty() {
+            lines.push("近期情绪经历：".into());
+            for event in events {
+                lines.push(format!(
+                    "- {}：{} → {}，强度 {:.0}，原因 {}",
+                    event.source,
+                    event.mood_before,
+                    event.mood_after,
+                    event.intensity_after,
+                    short(&event.cause, 70)
+                ));
+            }
+        }
+        let facts = self.recent_semantic_memories(5);
+        if !facts.is_empty() {
+            lines.push("[用户已确认的长期事实]".into());
+            for fact in facts {
+                lines.push(format!("- {}", short(&fact.content, 120)));
+            }
+        }
+        let memories = self.recent_emotional_memories(2);
+        if !memories.is_empty() {
+            lines.push("相关情绪记忆：".into());
+            for memory in memories {
+                lines.push(format!("- {}", short(&memory.content, 100)));
+            }
+        }
         lines.join("\n")
     }
-
     /// 最近值得记住的记忆（按 重要性×新鲜度×情绪匹配 排序）。
     pub fn recent_memories(&self, k: usize) -> Vec<&MemoryRecord> {
         self.memory.top_k(now_ms(), self.mood(), &self.cfg.memory_scoring, k)
@@ -589,6 +812,7 @@ impl Soul {
         let emotion_json = serde_json::to_string_pretty(&self.emotion)?;
         std::fs::write(self.dir.join("emotion.json"), emotion_json)?;
         std::fs::write(self.dir.join("affect.json"), serde_json::to_string_pretty(&self.affect)?)?;
+        save_emotion_events(&self.dir, &self.emotion_events)?;
         std::fs::write(self.dir.join("traits.json"), serde_json::to_string_pretty(&self.traits)?)?;
         let rel_json = serde_json::to_string_pretty(&self.relationship)?;
         std::fs::write(self.dir.join("relationship.json"), rel_json)?;
@@ -674,6 +898,9 @@ impl Soul {
     }
 
     fn apply_event_trigger(&mut self, id: &str) {
+        self.advance_time(now_ms());
+        let before_emotion = self.emotion.clone();
+        let before_affect = self.affect.clone();
         let Some(t) = self
             .cfg
             .behavior_rules
@@ -683,16 +910,41 @@ impl Soul {
         else {
             return;
         };
-        self.emotion.apply_deltas(&t.deltas);
+        let intent = t.intent.clone();
+        let value = t.value.clone();
+        let deltas = t.deltas.clone();
+        self.emotion.apply_deltas(&deltas);
         self.last_intent = Some(IntentInfo {
-            intent: t.intent.clone(),
-            cause: None,
-            value: t.value.clone(),
+            intent,
+            cause: Some(format!("运行时事件：{id}")),
+            value,
         });
+        self.refresh_affect(None);
         self.maybe_milestone();
+        let importance = if matches!(id, "task_failure" | "verify_fail" | "approval_denied") {
+            65
+        } else {
+            45
+        };
+        let valence = if matches!(id, "task_success" | "verify_pass") {
+            1
+        } else if matches!(id, "task_failure" | "verify_fail" | "approval_denied" | "interrupted") {
+            -1
+        } else {
+            0
+        };
+        self.record_emotion_event(
+            "runtime",
+            Some(id.to_string()),
+            &format!("运行时事件：{id}"),
+            &before_emotion,
+            &before_affect,
+            importance,
+            valence,
+            "",
+        );
         self.dirty = true;
     }
-
     fn maybe_milestone(&mut self) {
         let cur = self.stage();
         if let Some(prev_id) = &self.last_stage_id {
@@ -760,7 +1012,33 @@ fn load_emotion(dir: &Path) -> Option<EmotionState> {
 
 fn load_affect(dir: &Path) -> Option<AffectState> {
     std::fs::read_to_string(dir.join("affect.json")).ok().and_then(|text| serde_json::from_str(&text).ok())
+}fn load_emotion_events(dir: &Path) -> VecDeque<EmotionEvent> {
+    let path = dir.join("emotion_events.jsonl");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return VecDeque::new();
+    };
+    let mut events = VecDeque::new();
+    for line in text.lines() {
+        if let Ok(event) = serde_json::from_str::<EmotionEvent>(line) {
+            events.push_back(event);
+            while events.len() > MAX_EMOTION_EVENTS {
+                events.pop_front();
+            }
+        }
+    }
+    events
 }
+
+fn save_emotion_events(dir: &Path, events: &VecDeque<EmotionEvent>) -> anyhow::Result<()> {
+    let mut out = String::new();
+    for event in events {
+        out.push_str(&serde_json::to_string(event)?);
+        out.push('\n');
+    }
+    std::fs::write(dir.join("emotion_events.jsonl"), out)?;
+    Ok(())
+}
+
 
 fn load_traits(dir: &Path) -> Option<TraitState> {
     std::fs::read_to_string(dir.join("traits.json")).ok().and_then(|text| serde_json::from_str(&text).ok())
@@ -808,6 +1086,154 @@ fn load_meta(dir: &Path) -> SoulMeta {
     }
 }
 
+fn extract_user_fact_drafts(text: &str) -> Vec<MemoryDraft> {
+    let mut drafts = Vec::new();
+    for sentence in text.split(['。', '！', '？', '!', '?', ';', '；']) {
+        let sentence = sentence.trim();
+        if sentence.is_empty() {
+            continue;
+        }
+        let mut candidate = sentence;
+        let mut explicit_marker = false;
+        for marker in ["记住", "别忘了"] {
+            if let Some(index) = candidate.find(marker) {
+                candidate = &candidate[index + marker.len()..];
+                explicit_marker = true;
+                break;
+            }
+        }
+
+        candidate = candidate.trim_start_matches(['：', ':', ',', '，', ' ']);
+        let explicit_name = extract_fact_value(
+            candidate,
+            &["我的名字是", "你可以叫我", "请叫我", "我叫"],
+        )
+        .and_then(clean_fact_value);
+        let self_intro_name = candidate
+            .strip_prefix("我是")
+            .and_then(clean_fact_value)
+            .filter(|value| is_unambiguous_self_intro_name(value));
+        if let Some(value) = explicit_name.or(self_intro_name) {
+            if is_name_like(&value) {
+                drafts.push(MemoryDraft {
+                    kind: "semantic".into(),
+                    content: format!("用户姓名：{value}"),
+                    importance: 95,
+                    valence: 0,
+                    tags: vec!["user_stated".into(), "identity".into(), "user_name".into()],
+                });
+                continue;
+            }
+        }
+
+        let mut recognized_fact = false;
+        for (prefix, label, tags, importance) in [
+            ("我喜欢", "用户喜欢", vec!["user_stated", "preference"], 75u8),
+            ("我不喜欢", "用户不喜欢", vec!["user_stated", "preference"], 75u8),
+            ("我的目标是", "用户的目标", vec!["user_stated", "goal"], 85u8),
+            ("我计划", "用户的计划", vec!["user_stated", "goal"], 85u8),
+            ("我打算", "用户的计划", vec!["user_stated", "goal"], 85u8),
+            ("我准备", "用户的计划", vec!["user_stated", "goal"], 85u8),
+        ] {
+            if let Some(value) = extract_fact_value(candidate, &[prefix])
+                .and_then(clean_fact_value)
+                .filter(|value| !tags.contains(&"preference") || is_durable_preference(value))
+            {
+                drafts.push(MemoryDraft {
+                    kind: "semantic".into(),
+                    content: format!("{label}：{value}"),
+                    importance,
+                    valence: 0,
+                    tags: tags.into_iter().map(String::from).collect(),
+                });
+                recognized_fact = true;
+                break;
+            }
+        }
+
+        if explicit_marker && !recognized_fact {
+            if let Some(value) = clean_fact_value(candidate) {
+                if !value.is_empty()
+                    && !value.starts_with("我叫")
+                    && !value.starts_with("我是")
+                    && !value.starts_with("我的名字是")
+                {
+                    drafts.push(MemoryDraft {
+                        kind: "semantic".into(),
+                        content: format!("用户明确要求记住：{value}"),
+                        importance: 80,
+                        valence: 0,
+                        tags: vec!["user_stated".into(), "explicit_memory".into()],
+                    });
+                }
+            }
+        }
+    }
+    drafts
+}
+
+fn extract_fact_value<'a>(text: &'a str, prefixes: &[&str]) -> Option<&'a str> {
+    prefixes.iter().find_map(|prefix| text.strip_prefix(prefix))
+}
+
+fn clean_fact_value(value: &str) -> Option<String> {
+    let value = value
+        .trim()
+        .trim_start_matches(['：', ':', ',', '，', ' '])
+        .split(['。', '！', '？', '!', '?', ',', '，', ';', '；'])
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if value.is_empty() || value.chars().count() > 80 {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn is_unambiguous_self_intro_name(value: &str) -> bool {
+    let count = value.chars().count();
+    let discourse_prefixes = [
+        "说", "想说", "觉得", "想", "问", "让", "要", "在", "来", "给", "把", "因为",
+        "不是", "只是", "叫你", "叫她", "叫他", "喜欢", "不喜欢",
+    ];
+    let role_suffixes = ["员", "师", "生", "者", "用户", "工程师", "程序员", "学生", "老师", "医生"];
+    (2..=6).contains(&count)
+        && !discourse_prefixes.iter().any(|prefix| value.starts_with(prefix))
+        && !role_suffixes.iter().any(|suffix| value.ends_with(suffix))
+        && !value.contains(['的', '了', '啊', '呀', '呢', '吧'])
+}
+
+fn is_durable_preference(value: &str) -> bool {
+    let conversational_targets = [
+        "的是", "你", "妳", "您", "他", "她", "它", "芙芙", "芙宁娜", "这个", "这样", "那样",
+    ];
+    !conversational_targets
+        .iter()
+        .any(|target| value.starts_with(target))
+}
+
+fn is_name_like(value: &str) -> bool {
+    let is_interrogative = matches!(value, "谁" | "什么" | "哪位" | "哪个" | "啥")
+        || value.contains("叫什么")
+        || value.ends_with('吗')
+        || value.ends_with('呢');
+    if value.chars().count() > 20
+        || value.contains(char::is_whitespace)
+        || value.starts_with("一个")
+        || value.starts_with("一名")
+        || value.starts_with("来自")
+        || value.starts_with("正在")
+        || value.starts_with("喜欢")
+        || value.starts_with("不喜欢")
+        || is_interrogative
+    {
+        return false;
+    }
+    true
+}
+
 fn short(s: &str, n: usize) -> String {
     let t: String = s.chars().take(n).collect();
     if s.chars().count() > n {
@@ -839,6 +1265,10 @@ mod tests {
         let block = s.context_block();
         assert!(block.contains("当前情绪：proud"));
         assert!(block.contains("最近原因：用户夸奖了你"));
+        assert!(block.contains("[当前关系表达]"));
+        assert!(block.contains("表达倾向："));
+        assert!(block.contains("亲近许可："));
+        assert!(block.contains("边界方式："));
         assert!(!block.contains("表达策略"));
         assert!(!block.contains("回复预算"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -848,8 +1278,56 @@ mod tests {
     fn scold_derives_hurt() {
         let dir = tmp_dir();
         let mut s = Soul::load(dir.clone());
-        s.observe_text("你怎么这么笨");
+        s.observe_text("你真是个没用的废物");
         assert_eq!(s.mood(), MoodKind::Hurt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn affectionate_tease_is_neutral_before_familiarity() {
+        let dir = tmp_dir();
+        let mut soul = Soul::load(dir.clone());
+        soul.emotion.trust = 10.0;
+        let trust_before = soul.emotion.trust;
+        let attachment_before = soul.emotion.attachment;
+        let stress_before = soul.emotion.stress;
+        assert!(soul.observe_text("你这个小笨蛋"));
+        assert!((soul.emotion.trust - trust_before).abs() < 0.001);
+        assert!((soul.emotion.attachment - attachment_before).abs() < 0.001);
+        assert!((soul.emotion.stress - stress_before).abs() < 0.001);
+        assert_eq!(
+            soul.last_intent.as_ref().map(|intent| intent.intent.as_str()),
+            Some("acknowledge_tease_without_overfamiliarity")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn affectionate_tease_builds_closeness_when_familiar() {
+        let dir = tmp_dir();
+        let mut soul = Soul::load(dir.clone());
+        soul.emotion.trust = 40.0;
+        let trust_before = soul.emotion.trust;
+        let attachment_before = soul.emotion.attachment;
+        assert!(soul.observe_text("小笨蛋呀"));
+        assert!((soul.emotion.trust - trust_before - 0.5).abs() < 0.001);
+        assert!((soul.emotion.attachment - attachment_before - 1.0).abs() < 0.001);
+        assert_eq!(
+            soul.last_intent.as_ref().map(|intent| intent.intent.as_str()),
+            Some("banter_playfully")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ambiguous_tease_word_is_not_a_damage_fallback() {
+        let dir = tmp_dir();
+        let mut soul = Soul::load(dir.clone());
+        let before = soul.emotion.clone();
+        assert!(!soul.observe_text("笨蛋"));
+        assert_eq!(soul.emotion.trust, before.trust);
+        assert_eq!(soul.emotion.stress, before.stress);
+        assert_eq!(soul.emotion.confidence, before.confidence);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1278,13 +1756,13 @@ mod tests {
     fn repeated_scolding_escalates_and_apology_recovers_gradually() {
         let dir = tmp_dir();
         let mut s = Soul::load(dir.clone());
-        s.observe_text("你是笨蛋");
+        s.observe_text("你就是个废物");
         let first = s.affect.intensity;
         assert!(s.affect.unresolved);
-        s.observe_text("你还是笨蛋");
+        s.observe_text("你还是没用的东西");
         let second = s.affect.intensity;
         assert!(second > first);
-        s.observe_text("你就是大笨蛋");
+        s.observe_text("你真是个垃圾");
         assert!(s.affect.intensity >= second);
         assert!(matches!(s.affect.conflict_level.as_str(), "medium" | "severe"));
 
@@ -1323,6 +1801,174 @@ mod tests {
         assert!(block.contains("当前情绪："));
         assert!(!block.contains("表达策略"));
         assert!(!block.contains("不贬低第三方"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn emotion_events_capture_and_persist() {
+        let dir = tmp_dir();
+        let mut soul = Soul::load(dir.clone());
+        assert!(!soul.observe_text("今天过得怎么样"));
+        assert!(soul.observe_text("干得漂亮！"));
+        assert!(soul.emotion_events.iter().any(|event| event.trigger_id.as_deref() == Some("praise")));
+        assert!(soul.emotion_events.iter().any(|event| event.important));
+        soul.save().unwrap();
+        let loaded = Soul::load(dir.clone());
+        assert!(loaded.emotion_events.iter().any(|event| event.trigger_id.as_deref() == Some("praise")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn emotion_event_history_is_bounded() {
+        let dir = tmp_dir();
+        let mut soul = Soul::load(dir.clone());
+        for _ in 0..80 {
+            soul.observe_text("普通聊天");
+        }
+        assert_eq!(soul.emotion_events.len(), MAX_EMOTION_EVENTS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_user_facts_are_extracted_and_persisted() {
+        let dir = tmp_dir();
+        let mut soul = Soul::load(dir.clone());
+        assert!(soul.observe_user_facts("我叫念逐野"));
+        assert!(soul.memory.records.iter().any(|record| {
+            record.kind == "semantic"
+                && record.content == "用户姓名：念逐野"
+                && record.tags.iter().any(|tag| tag == "user_name")
+        }));
+        assert!(soul.context_block().contains("用户姓名：念逐野"));
+        soul.save().unwrap();
+        let loaded = Soul::load(dir.clone());
+        assert!(loaded
+            .memory
+            .records
+            .iter()
+            .any(|record| record.content == "用户姓名：念逐野"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn user_name_fact_is_updated_without_duplicates() {
+        let dir = tmp_dir();
+        let mut soul = Soul::load(dir.clone());
+        soul.add_memories(vec![MemoryDraft {
+            kind: "semantic".into(),
+            content: "用户姓名：谁".into(),
+            importance: 95,
+            valence: 0,
+            tags: vec!["user_stated".into(), "identity".into()],
+        }]);
+        soul.observe_user_facts("我的名字是甲");
+        soul.observe_user_facts("你可以叫我念逐野");
+        let names: Vec<_> = soul
+            .memory
+            .records
+            .iter()
+            .filter(|record| record.tags.iter().any(|tag| tag == "user_name"))
+            .collect();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].content, "用户姓名：念逐野");
+        assert!(soul.memory.records.iter().all(|record| record.content != "用户姓名：谁"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn interrogative_name_is_not_saved_as_user_fact() {
+        let dir = tmp_dir();
+        let mut soul = Soul::load(dir.clone());
+        assert!(!soul.observe_user_facts("我的名字是谁"));
+        assert!(soul.memory.records.iter().all(|record| record.kind != "semantic"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn conversational_phrases_do_not_overwrite_name_or_create_preferences() {
+        let dir = tmp_dir();
+        let mut soul = Soul::load(dir.clone());
+        assert!(soul.observe_user_facts("我的名字是念逐野"));
+        assert!(!soul.observe_user_facts("我是说小笨蛋芙芙"));
+        assert!(!soul.observe_user_facts("我喜欢的是你啊"));
+        let semantic: Vec<_> = soul
+            .memory
+            .records
+            .iter()
+            .filter(|record| record.kind == "semantic")
+            .collect();
+        assert_eq!(semantic.len(), 1);
+        assert_eq!(semantic[0].content, "用户姓名：念逐野");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ambiguous_self_intro_role_is_not_saved_as_a_name() {
+        let dir = tmp_dir();
+        let mut soul = Soul::load(dir.clone());
+        assert!(!soul.observe_user_facts("我是程序员"));
+        assert!(soul.memory.records.iter().all(|record| record.kind != "semantic"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_preferences_and_goals_are_facts_but_ordinary_chat_is_not() {
+        let dir = tmp_dir();
+        let mut soul = Soul::load(dir.clone());
+        soul.observe_user_facts("我喜欢咖啡。我打算周末完成项目");
+        soul.observe_user_facts("今天天气不错，随便聊聊");
+        assert!(soul.memory.records.iter().any(|record| {
+            record.content == "用户喜欢：咖啡"
+                && record.tags.iter().any(|tag| tag == "preference")
+        }));
+        assert!(soul.memory.records.iter().any(|record| {
+            record.content == "用户的计划：周末完成项目"
+                && record.tags.iter().any(|tag| tag == "goal")
+        }));
+        assert_eq!(
+            soul.memory
+                .records
+                .iter()
+                .filter(|record| record.kind == "semantic")
+                .count(),
+            2
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ordinary_interaction_does_not_promote_memory() {
+        let dir = tmp_dir();
+        let mut soul = Soul::load(dir.clone());
+        soul.observe_text("你好，今天阳光不错");
+        assert!(soul.emotion_events.iter().any(|event| !event.important));
+        assert!(soul.memory.records.iter().all(|record| record.kind != "emotional"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runtime_event_is_recorded_with_source() {
+        let dir = tmp_dir();
+        let mut soul = Soul::load(dir.clone());
+        soul.observe_event(&Event::ApprovalDenied { kind: "test".into() });
+        assert!(soul.emotion_events.iter().any(|event| {
+            event.source == "runtime" && event.trigger_id.as_deref() == Some("approval_denied")
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn context_includes_limited_emotion_history() {
+        let dir = tmp_dir();
+        let mut soul = Soul::load(dir.clone());
+        for _ in 0..8 {
+            soul.observe_text("干得漂亮！");
+            soul.observe_text("你怎么这么笨");
+        }
+        let block = soul.context_block();
+        assert!(block.contains("近期情绪经历："));
+        assert!(block.contains("相关情绪记忆："));
+        assert!(soul.recent_emotion_events(3).len() <= 3);
+        assert!(soul.recent_emotional_memories(2).len() <= 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

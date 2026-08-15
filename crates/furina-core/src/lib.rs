@@ -21,5 +21,5 @@ pub mod web_cache;
 pub use config::Config;
 pub use asr::AsrClient;
 pub use vision::VisionClient;
-pub use voice::VoiceClient;
+pub use voice::{VoiceClient, VoiceSynthesisProfile};
 pub use web_cache::{WebCache, WebCacheEntry};

@@ -14,7 +14,7 @@ use furina_core::asr::AsrClient;
 use furina_core::config::{Config, EmotionClassifierConfig, ProviderConfig};
 use furina_core::interject::{InterjectCtx, Interjector};
 use furina_core::sidecar::{EventSink, Sidecar};
-use furina_core::voice::VoiceClient;
+use furina_core::voice::{VoiceClient, VoiceSynthesisProfile};
 use furina_proto::Event;
 use furina_soul::Soul;
 use migration::MAX_AVATAR_BYTES;
@@ -219,12 +219,15 @@ async fn chat_send(state: State<'_, AppState>, text: String) -> Result<(), Strin
     let result = agent.run_task(&text).await;
     *state.agent.lock().map_err(|error| error.to_string())? = Some(agent);
     *state.agent_state.lock().unwrap() = "idle".into();
+    let save_result = state.soul.lock().unwrap().save();
+    let _ = state.app.emit("furina-soul", serde_json::json!({}));
     if let Err(error) = result {
-        let _ = state.app.emit("furina-soul", serde_json::json!({}));
+        if let Err(save_error) = save_result {
+            return Err(format!("{}；灵魂状态保存失败：{}", error, save_error));
+        }
         return Err(error.to_string());
     }
-    let _ = state.soul.lock().unwrap().save();
-    let _ = state.app.emit("furina-soul", serde_json::json!({}));
+    save_result.map_err(|error| format!("灵魂状态保存失败：{error}"))?;
     Ok(())
 }
 
@@ -237,12 +240,23 @@ async fn transcribe(state: State<'_, AppState>, audio: Vec<u8>, mime: String) ->
 
 #[tauri::command]
 async fn tts_synthesize(
-    state: State<'_, AppState>, text: String, emotion: String, speed: f64,
+    state: State<'_, AppState>,
+    text: String,
+    profile: Option<VoiceSynthesisProfile>,
+    emotion: Option<String>,
+    speed: Option<f64>,
 ) -> Result<serde_json::Value, String> {
     let voice = state.services.lock().map_err(|error| error.to_string())?.voice.clone()
         .ok_or("语音合成未配置，请在首次设置中启用 TTS")?;
     let format = voice.format().to_string();
-    let data = voice.synthesize_bytes(&text, &emotion, speed).await.map_err(|error| error.to_string())?;
+    let profile = profile.unwrap_or_else(|| VoiceSynthesisProfile::legacy(
+        emotion.as_deref().unwrap_or_default(),
+        speed.unwrap_or(1.0),
+    ));
+    let data = voice
+        .synthesize_bytes_with_profile(&text, &profile)
+        .await
+        .map_err(|error| error.to_string())?;
     Ok(serde_json::json!({ "format": format, "data": data }))
 }
 
@@ -258,13 +272,47 @@ async fn approval_respond(state: State<'_, AppState>, id: String, ok: bool) -> R
 #[tauri::command]
 async fn get_soul_state(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let paths = state.paths.read().map_err(|error| error.to_string())?.clone();
-    let soul = state.soul.lock().unwrap();
+    let mut soul = state.soul.lock().unwrap();
+    soul.advance_time(furina_soul::now_ms());
     let mood = soul.mood();
     let stage = soul.stage();
     let emotions = &soul.emotion;
+    let recent_emotion_events: Vec<_> = soul
+        .recent_emotion_events(3)
+        .into_iter()
+        .map(|event| serde_json::json!({
+            "timestamp": event.timestamp,
+            "source": event.source,
+            "triggerId": event.trigger_id,
+            "cause": event.cause,
+            "moodBefore": event.mood_before,
+            "moodAfter": event.mood_after,
+            "intensityBefore": event.intensity_before,
+            "intensityAfter": event.intensity_after,
+            "deltas": event.deltas,
+            "trend": event.trend,
+            "unresolved": event.unresolved,
+            "important": event.important,
+        }))
+        .collect();
+    let recent_emotional_memories: Vec<_> = soul
+        .recent_emotional_memories(2)
+        .into_iter()
+        .map(|record| serde_json::json!({
+            "id": record.id,
+            "content": record.content,
+            "importance": record.importance_score,
+            "valence": record.valence,
+            "tags": record.tags,
+            "emotion": record.emotion,
+        }))
+        .collect();
     let root_name = paths.workspace_root.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_else(|| "workspace".into());
+    let valence = emotion_valence(emotions);
+    let arousal = emotion_arousal(emotions);
+    let intensity = (soul.affect.intensity / 100.0).clamp(0.0, 1.0);
     Ok(serde_json::json!({
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "timestamp": furina_soul::now_ms(),
         "workspace": {
             "root": paths.data_root.display().to_string(),
@@ -274,7 +322,13 @@ async fn get_soul_state(state: State<'_, AppState>) -> Result<serde_json::Value,
         },
         "mood": mood.as_str(),
         "mood_label": mood.label(),
-        "intensity": mood_intensity(mood.as_str(), emotions),
+        "intensity": intensity,
+        "emotion_profile": {
+            "valence": valence,
+            "arousal": arousal,
+            "intensity": intensity,
+            "trend": soul.affect.trend,
+        },
         "affect": {
             "primary": soul.affect.primary,
             "secondary": soul.affect.secondary,
@@ -290,6 +344,8 @@ async fn get_soul_state(state: State<'_, AppState>) -> Result<serde_json::Value,
             "confidence": emotions.confidence, "trust": emotions.trust, "attachment": emotions.attachment,
             "energy": emotions.energy, "stress": emotions.stress, "pride": emotions.pride,
         },
+        "recent_emotion_events": recent_emotion_events,
+        "recent_emotional_memories": recent_emotional_memories,
         "memory_count": soul.memory.records.len(),
         "last_intent": soul.last_intent.as_ref().map(|intent| serde_json::json!({
             "intent": intent.intent, "cause": intent.cause, "value": intent.value,
@@ -299,36 +355,73 @@ async fn get_soul_state(state: State<'_, AppState>) -> Result<serde_json::Value,
     }))
 }
 
-fn mood_intensity(mood: &str, emotions: &furina_soul::EmotionState) -> f64 {
-    let value = |dimension: &str| match dimension {
-        "confidence" => emotions.confidence, "trust" => emotions.trust, "attachment" => emotions.attachment,
-        "energy" => emotions.energy, "stress" => emotions.stress, "pride" => emotions.pride, _ => 0.0,
-    };
-    let baseline = |dimension: &str| match dimension {
-        "confidence" => 45.0, "trust" => 20.0, "attachment" => 10.0, "energy" => 60.0,
-        "stress" => 20.0, "pride" => 40.0, _ => 0.0,
-    };
-    let dimensions: &[&str] = match mood {
-        "proud" => &["pride", "confidence"], "happy" => &["energy", "confidence"],
-        "hurt" => &["stress", "trust"], "sad" => &["energy"], "annoyed" => &["stress", "energy"], _ => &[],
-    };
-    let intensity = if dimensions.is_empty() {
-        (value("pride") - baseline("pride")).abs() / 100.0
-    } else {
-        dimensions.iter().map(|dimension| (value(dimension) - baseline(dimension)).abs() / 100.0).sum::<f64>() / dimensions.len() as f64
-    };
-    intensity.clamp(0.0, 1.0)
+fn emotion_valence(emotions: &furina_soul::EmotionState) -> f64 {
+    ((
+        (emotions.confidence - 45.0)
+            + (emotions.trust - 20.0)
+            + (emotions.attachment - 10.0)
+            + (emotions.pride - 40.0)
+            - (emotions.stress - 20.0) * 1.5
+    ) / 200.0)
+        .clamp(-1.0, 1.0)
+}
+
+fn emotion_arousal(emotions: &furina_soul::EmotionState) -> f64 {
+    ((emotions.energy + emotions.stress) / 200.0).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod emotion_profile_tests {
+    use super::{emotion_arousal, emotion_valence};
+    use furina_soul::EmotionState;
+
+    #[test]
+    fn valence_is_neutral_at_baseline_and_negative_under_stress() {
+        let baseline = EmotionState {
+            confidence: 45.0,
+            trust: 20.0,
+            attachment: 10.0,
+            energy: 60.0,
+            stress: 20.0,
+            pride: 40.0,
+            updated_ms: 0,
+        };
+        let mut stressed = baseline.clone();
+        stressed.stress = 90.0;
+        assert_eq!(emotion_valence(&baseline), 0.0);
+        assert!(emotion_valence(&stressed) < 0.0);
+    }
+
+    #[test]
+    fn arousal_stays_in_range() {
+        let emotions = EmotionState {
+            confidence: 0.0,
+            trust: 0.0,
+            attachment: 0.0,
+            energy: 100.0,
+            stress: 100.0,
+            pride: 0.0,
+            updated_ms: 0,
+        };
+        assert_eq!(emotion_arousal(&emotions), 1.0);
+    }
 }
 
 #[tauri::command]
 async fn get_memories(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let soul = state.soul.lock().unwrap();
+    let mut soul = state.soul.lock().unwrap();
+    soul.advance_time(furina_soul::now_ms());
     let records: Vec<_> = soul.memory.records.iter().rev().take(30).map(|record| serde_json::json!({
-        "id": record.id, "type": record.kind, "content": record.content, "importance": record.importance_score,
+        "id": record.id,
+        "type": record.kind,
+        "content": record.content,
+        "importance": record.importance_score,
+        "valence": record.valence,
+        "tags": record.tags,
+        "emotion": record.emotion,
     })).collect();
     Ok(serde_json::json!(records))
 }
-
 fn avatar_asset_path(data_root: &Path) -> PathBuf { data_root.join(".furina/avatar/Furina.vrm") }
 
 fn validate_avatar_asset(data_root: &Path) -> Result<(PathBuf, fs::Metadata), String> {

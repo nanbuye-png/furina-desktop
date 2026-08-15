@@ -12,6 +12,7 @@
 use crate::config::Config;
 use crate::proxy::apply_system_proxy;
 use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -48,6 +49,40 @@ enum VoiceKind {
         model: String,
         voice: String,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct VoiceSynthesisProfile {
+    pub emotion: String,
+    pub speed: f64,
+    pub volume: Option<f64>,
+    pub normalize_loudness: Option<bool>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+}
+
+impl Default for VoiceSynthesisProfile {
+    fn default() -> Self {
+        Self {
+            emotion: String::new(),
+            speed: 1.0,
+            volume: None,
+            normalize_loudness: None,
+            temperature: None,
+            top_p: None,
+        }
+    }
+}
+
+impl VoiceSynthesisProfile {
+    pub fn legacy(emotion: &str, speed: f64) -> Self {
+        Self {
+            emotion: emotion.to_string(),
+            speed,
+            ..Self::default()
+        }
+    }
 }
 
 impl VoiceClient {
@@ -167,7 +202,8 @@ impl VoiceClient {
     /// 合成语音并写入输出目录，返回音频文件路径。
     /// `speed`：朗读语速（0.5–2.0，1.0 为正常）。
     pub async fn synthesize(&self, text: &str, emotion: &str, speed: f64) -> anyhow::Result<PathBuf> {
-        let bytes = self.request_audio(text, emotion, speed).await?;
+        let profile = VoiceSynthesisProfile::legacy(emotion, speed);
+        let bytes = self.request_audio(text, &profile).await?;
         std::fs::create_dir_all(&self.output_dir)?;
         let ext = match self.format.as_str() {
             "wav" => "wav",
@@ -188,11 +224,24 @@ impl VoiceClient {
         emotion: &str,
         speed: f64,
     ) -> anyhow::Result<Vec<u8>> {
-        self.request_audio(text, emotion, speed).await
+        let profile = VoiceSynthesisProfile::legacy(emotion, speed);
+        self.request_audio(text, &profile).await
+    }
+
+    pub async fn synthesize_bytes_with_profile(
+        &self,
+        text: &str,
+        profile: &VoiceSynthesisProfile,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.request_audio(text, profile).await
     }
 
     /// 共享请求逻辑：文本清理 → 情绪标记 → 按 provider 请求 → 音频字节。
-    async fn request_audio(&self, text: &str, emotion: &str, speed: f64) -> anyhow::Result<Vec<u8>> {
+    async fn request_audio(
+        &self,
+        text: &str,
+        profile: &VoiceSynthesisProfile,
+    ) -> anyhow::Result<Vec<u8>> {
         let cleaned = clean_for_tts(text, self.max_text_len);
         if cleaned.is_empty() {
             anyhow::bail!("没有可合成的文本");
@@ -201,20 +250,20 @@ impl VoiceClient {
             VoiceKind::Fish { api_key, endpoint, model, reference_id } => {
                 // fish S2 系列支持方括号情绪标记（如 [happy]）；qwen omni 不支持，
                 // 加了会被当成正文朗读出来。
-                let tag = Self::emotion_tag(emotion);
+                let tag = Self::emotion_tag(&profile.emotion);
                 let payload = if tag.is_empty() {
                     cleaned
                 } else {
                     format!("{tag}{cleaned}")
                 };
-                self.request_fish(&payload, speed, api_key, endpoint, model, reference_id)
+                self.request_fish(&payload, profile, api_key, endpoint, model, reference_id)
                     .await
             }
             VoiceKind::Qwen { api_key, base_url, model, voice } => {
                 self.request_qwen(&cleaned, api_key, base_url, model, voice).await
             }
             VoiceKind::OpenAi { api_key, endpoint, model, voice } => {
-                self.request_openai(&cleaned, speed, api_key, endpoint, model, voice).await
+                self.request_openai(&cleaned, profile.speed, api_key, endpoint, model, voice).await
             }
         }
     }
@@ -223,18 +272,32 @@ impl VoiceClient {
     async fn request_fish(
         &self,
         payload: &str,
-        speed: f64,
+        profile: &VoiceSynthesisProfile,
         api_key: &str,
         endpoint: &str,
         model: &str,
         reference_id: &str,
     ) -> anyhow::Result<Vec<u8>> {
-        let body = json!({
+        let mut prosody = json!({
+            "speed": profile.speed.clamp(0.5, 2.0),
+        });
+        if let Some(volume) = profile.volume {
+            prosody["volume"] = json!(volume.clamp(-6.0, 6.0));
+        }
+        if let Some(normalize_loudness) = profile.normalize_loudness {
+            prosody["normalize_loudness"] = json!(normalize_loudness);
+        }
+        let mut body = json!({
             "text": payload,
             "format": self.format,
-            "prosody": {"speed": speed.clamp(0.5, 2.0)},
+            "prosody": prosody,
         });
-        let mut body = body;
+        if let Some(temperature) = profile.temperature {
+            body["temperature"] = json!(temperature.clamp(0.0, 1.0));
+        }
+        if let Some(top_p) = profile.top_p {
+            body["top_p"] = json!(top_p.clamp(0.0, 1.0));
+        }
         if !reference_id.is_empty() {
             body["reference_id"] = json!(reference_id);
         }
@@ -649,9 +712,9 @@ mod tests {
         let body = b"ID3 mock audio bytes".to_vec();
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let addr = spawn_http_mock(200, body.clone(), captured.clone());
-        let cfg = fish_config(format!("http://{addr}"), "FURINA_TEST_VOICE_KEY");
+        let cfg = fish_config(format!("http://{addr}"), "FURINA_TEST_VOICE_WRITE_KEY");
         unsafe {
-            std::env::set_var("FURINA_TEST_VOICE_KEY", "test-key");
+            std::env::set_var("FURINA_TEST_VOICE_WRITE_KEY", "test-key");
         }
         let dir = std::env::temp_dir().join(format!("furina_voice_test_{}", unix_ms()));
         let client = VoiceClient::from_config(&cfg, &dir).unwrap();
@@ -668,8 +731,40 @@ mod tests {
         assert!(req.to_lowercase().contains("bearer test-key"), "应带 Bearer 鉴权");
         let _ = std::fs::remove_dir_all(&dir);
         unsafe {
-            std::env::remove_var("FURINA_TEST_VOICE_KEY");
+            std::env::remove_var("FURINA_TEST_VOICE_WRITE_KEY");
         }
+    }
+
+    #[tokio::test]
+    async fn fish_profile_sends_supported_expression_parameters() {
+        let body = b"ID3 expressive audio".to_vec();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let addr = spawn_http_mock(200, body.clone(), captured.clone());
+        let cfg = fish_config(format!("http://{addr}"), "FURINA_TEST_FISH_PROFILE_KEY");
+        unsafe { std::env::set_var("FURINA_TEST_FISH_PROFILE_KEY", "test-key"); }
+        let client = VoiceClient::from_config(&cfg, &std::env::temp_dir()).unwrap();
+        let profile = VoiceSynthesisProfile {
+            emotion: "[extremely angry]".into(),
+            speed: 1.12,
+            volume: Some(5.0),
+            normalize_loudness: Some(false),
+            temperature: Some(0.85),
+            top_p: Some(0.9),
+        };
+        let bytes = client
+            .synthesize_bytes_with_profile("别再这样了", &profile)
+            .await
+            .unwrap();
+        assert_eq!(bytes, body);
+        let request = captured.lock().unwrap().clone();
+        assert!(request.contains("[extremely angry]"), "{request}");
+        assert!(request.contains("\"speed\":1.12"), "{request}");
+        assert!(request.contains("\"volume\":5.0") || request.contains("\"volume\":5"), "{request}");
+        assert!(request.contains("\"normalize_loudness\":false"), "{request}");
+        assert!(request.contains("\"temperature\":0.85"), "{request}");
+        assert!(request.contains("\"top_p\":0.9"), "{request}");
+        assert!(!request.contains("pitch"), "Fish 请求不应虚构 pitch 参数: {request}");
+        unsafe { std::env::remove_var("FURINA_TEST_FISH_PROFILE_KEY"); }
     }
 
     #[tokio::test]
@@ -677,9 +772,9 @@ mod tests {
         let body = b"ID3 bytes only".to_vec();
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let addr = spawn_http_mock(200, body.clone(), captured.clone());
-        let cfg = fish_config(format!("http://{addr}"), "FURINA_TEST_VOICE_KEY");
+        let cfg = fish_config(format!("http://{addr}"), "FURINA_TEST_VOICE_BYTES_KEY");
         unsafe {
-            std::env::set_var("FURINA_TEST_VOICE_KEY", "test-key");
+            std::env::set_var("FURINA_TEST_VOICE_BYTES_KEY", "test-key");
         }
         let dir = std::env::temp_dir().join(format!("furina_voice_bytes_{}", unix_ms()));
         let client = VoiceClient::from_config(&cfg, &dir).unwrap();
@@ -687,7 +782,7 @@ mod tests {
         assert_eq!(bytes, body, "synthesize_bytes 应返回音频字节");
         assert!(!dir.exists(), "不落盘：输出目录不应被创建");
         unsafe {
-            std::env::remove_var("FURINA_TEST_VOICE_KEY");
+            std::env::remove_var("FURINA_TEST_VOICE_BYTES_KEY");
         }
     }
 
@@ -695,16 +790,16 @@ mod tests {
     async fn synthesize_surfaces_api_error() {
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let addr = spawn_http_mock(402, b"{\"error\":\"Insufficient API credit\"}".to_vec(), captured);
-        let cfg = fish_config(format!("http://{addr}"), "FURINA_TEST_VOICE_KEY");
+        let cfg = fish_config(format!("http://{addr}"), "FURINA_TEST_VOICE_ERROR_KEY");
         unsafe {
-            std::env::set_var("FURINA_TEST_VOICE_KEY", "test-key");
+            std::env::set_var("FURINA_TEST_VOICE_ERROR_KEY", "test-key");
         }
         let dir = std::env::temp_dir().join(format!("furina_voice_err_{}", unix_ms()));
         let client = VoiceClient::from_config(&cfg, &dir).unwrap();
         let err = client.synthesize("测试", "", 1.0).await.unwrap_err().to_string();
         assert!(err.contains("402"), "{err}");
         unsafe {
-            std::env::remove_var("FURINA_TEST_VOICE_KEY");
+            std::env::remove_var("FURINA_TEST_VOICE_ERROR_KEY");
         }
     }
 
@@ -748,16 +843,16 @@ mod tests {
         let mut cfg = Config::default();
         cfg.voice.enabled = true;
         cfg.voice.reference_id = "m".into();
-        cfg.voice.api_key_env = "FURINA_TEST_VOICE_KEY".into();
+        cfg.voice.api_key_env = "FURINA_TEST_VOICE_EMPTY_KEY".into();
         unsafe {
-            std::env::set_var("FURINA_TEST_VOICE_KEY", "k");
+            std::env::set_var("FURINA_TEST_VOICE_EMPTY_KEY", "k");
         }
         let rt = tokio::runtime::Runtime::new().unwrap();
         let client = VoiceClient::from_config(&cfg, &dir).unwrap();
         let err = rt.block_on(client.synthesize("```\n```", "", 1.0)).unwrap_err().to_string();
         assert!(err.contains("没有可合成"));
         unsafe {
-            std::env::remove_var("FURINA_TEST_VOICE_KEY");
+            std::env::remove_var("FURINA_TEST_VOICE_EMPTY_KEY");
         }
     }
 

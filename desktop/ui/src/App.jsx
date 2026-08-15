@@ -4,7 +4,10 @@ import { StreamBuffer } from "./lib/streaming.js";
 import { projectEmotions } from "./lib/projection.js";
 import { PcmRecorder } from "./lib/asr.js";
 import { TtsPipeline } from "./lib/tts.js";
+import { VoiceEmotionController } from "./lib/voiceEmotion.js";
 import AvatarStage from "./avatar/AvatarStage.jsx";
+import { moodReactionFor } from "./avatar/avatarBehavior.js";
+import { conversationStateFor } from "./avatar/avatarInteraction.js";
 import SetupWizard from "./SetupWizard.jsx";
 
 const MOOD_LABELS = {
@@ -24,21 +27,6 @@ const EMOTION_DIMS = [
   ["pride", "骄傲"],
 ];
 
-function moodToEmotionTag(mood) {
-  switch (mood) {
-    case "happy":
-    case "proud":
-      return "[happy]";
-    case "hurt":
-    case "sad":
-      return "[sad]";
-    case "annoyed":
-      return "[angry]";
-    default:
-      return "";
-  }
-}
-
 export default function App() {
   // ---------- 消息列表（ref 可变 + tick 触发渲染） ----------
   const msgsRef = useRef([]);
@@ -57,6 +45,7 @@ export default function App() {
   const [approval, setApproval] = useState(null);
   const [recording, setRecording] = useState(false);
   const [speaking, setSpeaking] = useState(false);
+  const [silentTalking, setSilentTalking] = useState(false);
   const [toolLog, setToolLog] = useState([]);
   const [memories, setMemories] = useState([]);
   const [setupStatus, setSetupStatus] = useState(null);
@@ -64,9 +53,19 @@ export default function App() {
 
   const speedRef = useRef(1.0);
   const soulRef = useRef(null);
+  const avatarRef = useRef(null);
+  const voiceOnRef = useRef(voiceOn);
+  const speakingRef = useRef(false);
+  const silentTalkingRef = useRef(false);
+  const voiceEmotionRef = useRef(new VoiceEmotionController());
+  const inputActivityTimerRef = useRef(null);
+  const previousMoodRef = useRef(null);
   useEffect(() => {
     speedRef.current = speed;
   }, [speed]);
+  useEffect(() => {
+    voiceOnRef.current = voiceOn;
+  }, [voiceOn]);
   useEffect(() => {
     soulRef.current = soul;
   }, [soul]);
@@ -92,16 +91,33 @@ export default function App() {
   useEffect(() => {
     ttsRef.current = new TtsPipeline({
       invoke,
-      emotionFor: () => moodToEmotionTag(soulRef.current?.mood || "calm"),
-      speedFor: () => speedRef.current,
+      voiceProfileFor: () => voiceEmotionRef.current.next(soulRef.current, speedRef.current),
       onStatus: (s) => pushMsg({ kind: "status", text: s }),
-      onSpeaking: setSpeaking,
+      onSpeaking: setTtsSpeaking,
     });
     return () => ttsRef.current?.stop();
   }, []);
   useEffect(() => {
     if (ttsRef.current) ttsRef.current.enabled = voiceOn;
+    if (!voiceOn) voiceEmotionRef.current.reset();
+    if (voiceOn && silentTalkingRef.current) {
+      silentTalkingRef.current = false;
+      setSilentTalking(false);
+      avatarRef.current?.talk(speakingRef.current);
+    }
   }, [voiceOn]);
+
+  function setTtsSpeaking(active) {
+    speakingRef.current = active;
+    setSpeaking(active);
+    avatarRef.current?.talk(active || silentTalkingRef.current);
+  }
+
+  function setSilentTalkingActive(active) {
+    silentTalkingRef.current = active;
+    setSilentTalking(active);
+    avatarRef.current?.talk(active || speakingRef.current);
+  }
 
   // ---------- 录音 ----------
   const recorderRef = useRef(
@@ -112,7 +128,9 @@ export default function App() {
   function appendAssistant(s) {
     const arr = msgsRef.current;
     const last = arr[arr.length - 1];
-    if (!currentAssistantRef.current || !last || last.kind !== "assistant") {
+    const startsNewAssistant = !currentAssistantRef.current || !last || last.kind !== "assistant";
+    const wasEmpty = startsNewAssistant || !currentAssistantRef.current.text;
+    if (startsNewAssistant) {
       const m = { kind: "assistant", text: "" };
       arr.push(m);
       currentAssistantRef.current = m;
@@ -120,6 +138,13 @@ export default function App() {
     currentAssistantRef.current.text +=
       (currentAssistantRef.current.text ? "\n" : "") + s;
     tick();
+    if (wasEmpty) {
+      setThinking(false);
+      avatarRef.current?.think(false);
+      if (!voiceOnRef.current) {
+        setSilentTalkingActive(true);
+      }
+    }
     ttsRef.current?.speak(s);
   }
 
@@ -137,6 +162,12 @@ export default function App() {
           streamRef.current.reset();
           currentAssistantRef.current = null;
           setThinking(true);
+          ttsRef.current?.stop();
+          voiceEmotionRef.current.reset();
+          setSilentTalkingActive(false);
+          avatarRef.current?.listen(false);
+          avatarRef.current?.talk(false);
+          avatarRef.current?.think(true);
           break;
         case "message_delta":
           for (const s of streamRef.current.feed(ev.content || ""))
@@ -208,6 +239,8 @@ export default function App() {
           break;
         case "done":
           setThinking(false);
+          avatarRef.current?.think(false);
+          setSilentTalkingActive(false);
           if (!ev.success)
             pushMsg({ kind: "status", text: "⚠️ 任务未能完成：" + (ev.summary || "") });
           refreshSoul();
@@ -237,17 +270,29 @@ export default function App() {
 
   // ---------- 聊天 ----------
   async function chatSend(text) {
-    if (!text.trim()) return;
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    clearInputActivity();
     ttsRef.current?.stop();
-    pushMsg({ kind: "user", text: text.trim() });
+    voiceEmotionRef.current.reset();
+    setThinking(false);
+    setSilentTalkingActive(false);
+    avatarRef.current?.listen(false);
+    avatarRef.current?.think(false);
+    avatarRef.current?.talk(false);
+    avatarRef.current?.acknowledge();
+    pushMsg({ kind: "user", text: trimmed });
     try {
-      await invoke("chat_send", { text: text.trim() });
+      await invoke("chat_send", { text: trimmed });
     } catch (e) {
       pushMsg({
         kind: "status",
         text: "⚠️ 发送失败：" + (e && e.message ? e.message : e),
       });
       setThinking(false);
+      setSilentTalking(false);
+      voiceEmotionRef.current.reset();
+      avatarRef.current?.reset();
     }
   }
 
@@ -266,18 +311,25 @@ export default function App() {
     if (recording) { pushMsg({ kind: "status", text: "⚠️ 录音期间不能重新加载设置。" }); return; }
     if (thinking || approval) { pushMsg({ kind: "status", text: "⚠️ Furina 正在处理任务或等待审批，请稍后再打开设置。" }); return; }
     ttsRef.current?.stop();
+    voiceEmotionRef.current.reset();
     setShowSetup(true);
   }
 
   async function startRecord() {
+    clearInputActivity();
     ttsRef.current?.stop();
+    voiceEmotionRef.current.reset();
     const ok = await recorderRef.current.start();
-    if (ok) setRecording(true);
+    if (ok) {
+      setRecording(true);
+      avatarRef.current?.listen(true);
+    }
   }
 
   async function stopRecord() {
     const wav = recorderRef.current.stop();
     setRecording(false);
+    avatarRef.current?.listen(false);
     if (!wav) return;
     try {
       const text = await invoke("transcribe", {
@@ -291,7 +343,29 @@ export default function App() {
         kind: "status",
         text: "⚠️ 语音识别失败：" + (e && e.message ? e.message : e),
       });
+      setSilentTalkingActive(false);
+      avatarRef.current?.reset();
     }
+  }
+
+  function clearInputActivity() {
+    if (inputActivityTimerRef.current) {
+      clearTimeout(inputActivityTimerRef.current);
+      inputActivityTimerRef.current = null;
+    }
+  }
+
+  function handleInputActivity(active) {
+    clearInputActivity();
+    if (!active) {
+      avatarRef.current?.listen(false);
+      return;
+    }
+    avatarRef.current?.listen(true);
+    inputActivityTimerRef.current = setTimeout(() => {
+      inputActivityTimerRef.current = null;
+      avatarRef.current?.listen(false);
+    }, 900);
   }
 
   async function loadMemories() {
@@ -305,6 +379,23 @@ export default function App() {
 
   // 情绪投影（spec §6，前端 Desktop Layer 计算）
   const expr = projectEmotions(soul?.emotions || {}, soul?.mood || "calm");
+  const conversationState = conversationStateFor({
+    recording,
+    speaking: speaking || silentTalking,
+    thinking,
+  });
+
+  useEffect(() => {
+    const mood = soul?.mood;
+    if (!mood) return;
+    const previous = previousMoodRef.current;
+    previousMoodRef.current = mood;
+    if (!previous || previous === mood || recording || thinking || speaking || silentTalking) return;
+    const reaction = moodReactionFor(mood);
+    if (reaction) avatarRef.current?.react(reaction);
+  }, [soul?.mood, recording, thinking, speaking, silentTalking]);
+
+  useEffect(() => () => clearInputActivity(), []);
 
   // 自动滚动到底（贴底才跟随）
   const nearBottom = () => {
@@ -348,8 +439,8 @@ export default function App() {
             语速
             <input
               type="range"
-              min="0.5"
-              max="2"
+              min="0.8"
+              max="1.2"
               step="0.05"
               value={speed}
               onChange={(e) => setSpeed(parseFloat(e.target.value))}
@@ -359,12 +450,17 @@ export default function App() {
       </header>
 
       <AvatarStage
+        ref={avatarRef}
         mood={soul?.mood || "calm"}
         moodLabel={MOOD_LABELS[soul?.mood || "calm"]}
         intensity={expr.intensity}
         valence={expr.valence}
         arousal={expr.arousal}
-        speaking={speaking}
+        speaking={speaking || silentTalking}
+        recording={recording}
+        thinking={thinking}
+        conversationState={conversationState}
+        interactionBlocked={Boolean(approval)}
       />
 
       <div className="content">
@@ -402,6 +498,7 @@ export default function App() {
               </div>
               <Composer
                 onSend={chatSend}
+                onActivity={handleInputActivity}
                 recording={recording}
                 onStartRecord={startRecord}
                 onStopRecord={stopRecord}
@@ -445,11 +542,12 @@ function Message({ m }) {
   );
 }
 
-function Composer({ onSend, recording, onStartRecord, onStopRecord }) {
+function Composer({ onSend, onActivity, recording, onStartRecord, onStopRecord }) {
   const [input, setInput] = useState("");
   const send = () => {
     const t = input;
     setInput("");
+    onActivity(false);
     onSend(t);
   };
   return (
@@ -479,7 +577,12 @@ function Composer({ onSend, recording, onStartRecord, onStopRecord }) {
         value={input}
         placeholder="和 Furina 说点什么…（Enter 发送）"
         autoComplete="off"
-        onChange={(e) => setInput(e.target.value)}
+         onChange={(e) => {
+           const next = e.target.value;
+           setInput(next);
+           onActivity(Boolean(next.trim()));
+         }}
+         onBlur={() => onActivity(false)}
         onKeyDown={(e) => {
           if (e.key === "Enter") send();
         }}
@@ -565,7 +668,7 @@ function MemoryPanel({ memories, soul }) {
           <div className="memory-item" key={i}>
             <span className="memory-type">{m.type || "?"}</span>
             <span>{m.content}</span>
-            <em>★{m.importance ?? 0}</em>
+            <em>★{m.importance ?? 0}{m.valence ? ` · ${m.valence > 0 ? "+" : "−"}` : ""}</em>
           </div>
         ))
       )}

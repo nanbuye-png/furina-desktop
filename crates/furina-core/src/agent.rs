@@ -27,6 +27,8 @@ pub trait Approver: Send {
 pub trait PromptContextProvider: Send + Sync {
     /// 用户在本次回合的输入（用于更新情绪/关系）。
     fn observe_user_text(&self, text: &str);
+    /// 从原始用户输入中提取明确事实；默认实现保持旧行为兼容。
+    fn observe_user_facts(&self, _text: &str) {}
     /// 已验证的轻量语义分类结果；默认实现保持旧行为兼容。
     fn observe_trigger_id(&self, _trigger_id: &str) {}
     /// 运行时事件（工具调用/验证/审批/完成等），用于驱动情绪与记忆。
@@ -264,6 +266,7 @@ impl Agent {
             None
         };
         if let Some(provider) = &self.prompt_context {
+            provider.observe_user_facts(task);
             if let Some(analysis) = semantic_analysis.as_ref() {
                 provider.observe_trigger_id(analysis.accepted_trigger().unwrap_or(""));
             } else {

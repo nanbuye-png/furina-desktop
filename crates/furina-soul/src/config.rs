@@ -305,7 +305,7 @@ mod tests {
     #[test]
     fn detect_text_scold_beats_praise_on_tie() {
         let cfg = load();
-        let t = detect_text_trigger("真棒，但你怎么这么笨", &cfg.behavior_rules).unwrap();
+        let t = detect_text_trigger("真棒，但你就是个废物", &cfg.behavior_rules).unwrap();
         assert_eq!(t.id, "scold");
     }
 

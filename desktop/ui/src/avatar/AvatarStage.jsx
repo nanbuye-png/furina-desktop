@@ -1,6 +1,8 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { invoke, listen } from "../lib/tauri.js";
+import { AvatarBehaviorController } from "./avatarBehavior.js";
 import { VrmAvatarProvider } from "./VrmAvatarProvider.js";
+import { clickZoneForPointer, normalizePointer } from "./avatarInteraction.js";
 
 function normalizeArrayBuffer(payload) {
   if (payload instanceof ArrayBuffer) return payload;
@@ -25,19 +27,50 @@ function PlaceholderAvatar({ mood, intensity, speaking }) {
   );
 }
 
-export default function AvatarStage({
+const AvatarStage = forwardRef(function AvatarStage({
   mood,
   moodLabel,
   intensity,
   valence,
   arousal,
   speaking,
-}) {
+  recording,
+  thinking,
+  conversationState,
+  interactionBlocked,
+}, ref) {
   const viewportRef = useRef(null);
   const providerRef = useRef(null);
+  const behaviorRef = useRef(null);
+  const queuedBehaviorsRef = useRef([]);
   const [status, setStatus] = useState("loading");
   const [detail, setDetail] = useState("正在载入 Furina VRM");
   const [revision, setRevision] = useState(0);
+
+  useImperativeHandle(ref, () => {
+    const call = (name, ...args) => {
+      const behavior = behaviorRef.current;
+      if (behavior) return behavior[name](...args);
+      if (["acknowledge", "greet", "farewell", "react"].includes(name)) {
+        queuedBehaviorsRef.current.push({ name, args });
+        return { accepted: true, queued: true, behavior: name };
+      }
+      return false;
+    };
+    return {
+      acknowledge: () => call("acknowledge"),
+      listen: (active = true) => call("listen", active),
+      think: (active = true) => call("think", active),
+      talk: (active = true) => call("talk", active),
+      greet: () => call("greet"),
+      farewell: () => call("farewell"),
+      react: (kind) => call("react", kind),
+      reset: () => {
+        queuedBehaviorsRef.current = [];
+        return behaviorRef.current?.reset() ?? false;
+      },
+    };
+  }, []);
 
   useEffect(() => {
     let unlisten;
@@ -51,6 +84,10 @@ export default function AvatarStage({
     try {
       provider = new VrmAvatarProvider(viewportRef.current);
       providerRef.current = provider;
+      behaviorRef.current = new AvatarBehaviorController({
+        requestAction: (intent) => provider.handleIntent(intent),
+        onModeChange: (mode) => provider.setBehaviorMode(mode),
+      });
     } catch (error) {
       console.error("Avatar Renderer 初始化失败", error);
       setStatus("error");
@@ -71,6 +108,12 @@ export default function AvatarStage({
         if (!cancelled) {
           setStatus("ready");
           setDetail(`${info.fileName} · ${(info.sizeBytes / 1024 / 1024).toFixed(1)} MiB`);
+          const queued = queuedBehaviorsRef.current.splice(0);
+          if (queued.length > 0) {
+            queued.forEach(({ name, args }) => behaviorRef.current?.[name](...args));
+          } else {
+            behaviorRef.current?.greet();
+          }
         }
       } catch (error) {
         if (!cancelled) {
@@ -84,19 +127,104 @@ export default function AvatarStage({
     loadAvatar();
     return () => {
       cancelled = true;
+      behaviorRef.current?.reset();
+      behaviorRef.current = null;
       provider?.dispose();
       providerRef.current = null;
     };
   }, [revision]);
 
   useEffect(() => {
-    providerRef.current?.setState({ mood, intensity, speaking });
-  }, [mood, intensity, speaking]);
+    providerRef.current?.setInteractionContext({
+      mood,
+      intensity,
+      valence,
+      arousal,
+      speaking,
+      recording,
+      thinking,
+      conversationState,
+      blocked: interactionBlocked,
+    });
+    behaviorRef.current?.flushPending();
+  }, [
+    mood,
+    intensity,
+    valence,
+    arousal,
+    speaking,
+    recording,
+    thinking,
+    conversationState,
+    interactionBlocked,
+  ]);
+
+  useEffect(() => {
+    const provider = providerRef.current;
+    if (!provider) return undefined;
+    let focused = document.visibilityState === "visible" && document.hasFocus();
+    const handleFocus = () => {
+      const returned = !focused;
+      focused = true;
+      provider.setFocused(true);
+      behaviorRef.current?.flushPending();
+      if (returned && status === "ready") behaviorRef.current?.greet();
+    };
+    const handleBlur = () => {
+      focused = false;
+      provider.setFocused(false);
+    };
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") handleFocus();
+      else handleBlur();
+    };
+    window.addEventListener("focus", handleFocus);
+    window.addEventListener("blur", handleBlur);
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => {
+      window.removeEventListener("focus", handleFocus);
+      window.removeEventListener("blur", handleBlur);
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
+  }, [revision, status]);
+
+  function updatePointer(event, active = true) {
+    const provider = providerRef.current;
+    if (!provider) return;
+    const point = normalizePointer(
+      event.currentTarget.getBoundingClientRect(),
+      event.clientX,
+      event.clientY,
+    );
+    provider.setPointer(point.x, point.y, active);
+  }
+
+  function handlePointerDown(event) {
+    updatePointer(event);
+    const point = normalizePointer(
+      event.currentTarget.getBoundingClientRect(),
+      event.clientX,
+      event.clientY,
+    );
+    const provider = providerRef.current;
+    if (!provider?.triggerClickAt(point.x, point.y)) {
+      provider?.triggerClick(clickZoneForPointer(point));
+    }
+  }
 
   const showPlaceholder = status !== "ready";
   return (
     <main className={`avatar-stage avatar-stage-${status}`}>
-      <div className="avatar-viewport" ref={viewportRef} aria-label="Furina VRM Avatar" />
+      <div
+        className="avatar-viewport"
+        ref={viewportRef}
+        aria-label="Furina VRM Avatar"
+        role="img"
+        onPointerEnter={(event) => updatePointer(event)}
+        onPointerMove={(event) => updatePointer(event)}
+        onPointerLeave={() => providerRef.current?.clearPointer()}
+        onPointerDown={status === "ready" ? handlePointerDown : undefined}
+      />
       {showPlaceholder && (
         <PlaceholderAvatar mood={mood} intensity={intensity} speaking={speaking} />
       )}
@@ -109,4 +237,6 @@ export default function AvatarStage({
       </div>
     </main>
   );
-}
+});
+
+export default AvatarStage;

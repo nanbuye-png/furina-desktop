@@ -212,6 +212,10 @@ impl PromptContextProvider for SoulProvider {
         self.0.lock().unwrap().observe_text(text);
     }
 
+    fn observe_user_facts(&self, text: &str) {
+        self.0.lock().unwrap().observe_user_facts(text);
+    }
+
     fn observe_event(&self, event: &Event) {
         self.0.lock().unwrap().observe_event(event);
     }
@@ -279,6 +283,25 @@ mod tests {
             find_repo_root().is_some(),
             "应从可执行文件位置推断出仓库根目录"
         );
+    }
+
+    #[test]
+    fn soul_provider_observes_explicit_user_facts_from_raw_text() {
+        use crate::agent::PromptContextProvider;
+        use std::sync::{Arc, Mutex};
+
+        let dir = std::env::temp_dir().join(format!("furina_core_fact_{}", furina_soul::now_ms()));
+        let soul = Arc::new(Mutex::new(Soul::load(dir.clone())));
+        let provider = SoulProvider(soul.clone());
+        provider.observe_user_facts("我叫念逐野");
+        assert!(soul
+            .lock()
+            .unwrap()
+            .memory
+            .records
+            .iter()
+            .any(|record| record.content == "用户姓名：念逐野"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

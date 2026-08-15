@@ -2,10 +2,14 @@
 // stop() 递增令牌，使在途合成结果作废，避免旧语音重新入队。
 
 export class TtsPipeline {
-  constructor({ invoke, emotionFor, speedFor, onStatus, onSpeaking }) {
+  constructor({ invoke, emotionFor, speedFor, voiceProfileFor, onStatus, onSpeaking }) {
     this.invoke = invoke;
     this.emotionFor = emotionFor;
     this.speedFor = speedFor;
+    this.voiceProfileFor = voiceProfileFor || (() => ({
+      cue: this.emotionFor ? this.emotionFor() : "",
+      speed: this.speedFor ? this.speedFor() : 1,
+    }));
     this.onStatus = onStatus || (() => {});
     this.onSpeaking = onSpeaking || (() => {});
     this.ttsQueue = [];
@@ -31,10 +35,21 @@ export class TtsPipeline {
     while (this.ttsQueue.length > 0) {
       const text = this.ttsQueue.shift();
       try {
+        const profile = this.voiceProfileFor() || {};
+        const emotion = profile.cue || profile.emotion || "";
+        const speed = Number.isFinite(profile.speed) ? profile.speed : 1;
         const res = await this.invoke("tts_synthesize", {
           text,
-          emotion: this.emotionFor(),
-          speed: this.speedFor(),
+          emotion,
+          speed,
+          profile: {
+            emotion,
+            speed,
+            volume: Number.isFinite(profile.volume) ? profile.volume : null,
+            normalizeLoudness: profile.normalizeLoudness ?? null,
+            temperature: Number.isFinite(profile.temperature) ? profile.temperature : null,
+            topP: Number.isFinite(profile.topP) ? profile.topP : null,
+          },
         });
         if (!this.enabled || token !== this.synthToken) break;
         this.playQueue.push({ text, res });
