@@ -4,6 +4,7 @@
 pub mod asr;
 pub mod agent;
 pub mod app;
+pub mod app_launcher;
 pub mod config;
 pub mod context;
 pub mod gateway;

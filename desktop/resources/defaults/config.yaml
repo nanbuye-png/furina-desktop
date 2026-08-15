@@ -17,6 +17,19 @@ llm:
 persona: furina
 approval:
   mode: confirm
+  auto_approve_read_only_web: true
+tools:
+  safe_apps:
+    - id: qq_music
+      label: QQ音乐
+      executable: ""
+      args: []
+      enabled: true
+    - id: qq
+      label: QQ
+      executable: ""
+      args: []
+      enabled: true
 ui:
   mode: chat
 web:

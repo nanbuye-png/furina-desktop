@@ -8,7 +8,7 @@ Furina Desktop 是 Furina Personal AI Lifeform 的独立桌面实现。她不只
 
 项目原则：**人格是灵魂，Runtime 是大脑，工具是双手，安全是边界，验证是生命线。**
 
-历史 Furina Agent CLI 已冻结在 [nanbuye-png/furina-agent](https://github.com/nanbuye-png/furina-agent) 的 Tag/Release 中；本仓库自 v0.1.1 起是唯一后续开发主线。Desktop v0.1.2 已完成功能验收，当前进入 **Desktop v0.1.4 Persona v2.0 开发阶段**，不读取或共享 CLI 的本地历史数据。
+历史 Furina Agent CLI 已冻结在 [nanbuye-png/furina-agent](https://github.com/nanbuye-png/furina-agent) 的 Tag/Release 中；本仓库自 v0.1.1 起是唯一后续开发主线。Desktop v0.1.2 已完成功能验收，当前为 **Desktop v0.1.4 开发版**，已包含 Persona v2.0、持续情绪、事实记忆、情绪语音映射，以及基础工具审批与应用启动记忆；不读取或共享 CLI 的本地历史数据。
 
 ## 目录
 
@@ -33,7 +33,7 @@ Furina Desktop 是 Furina Personal AI Lifeform 的独立桌面实现。她不只
 
 | 项目 | 状态 |
 | --- | --- |
-| 当前版本 | **Desktop v0.1.4 Persona v2.0（开发中）** |
+| 当前版本 | **Desktop v0.1.4（应用审批与任务隔离更新）** |
 | 开发主线 | 本仓库 `main` |
 | 桌面框架 | Tauri 2 |
 | 前端 | React 18 + Vite 5 |
@@ -44,7 +44,7 @@ Furina Desktop 是 Furina Personal AI Lifeform 的独立桌面实现。她不只
 | Desktop 独立启动 | 已验证 |
 | CLI 数据共享 | **不共享** |
 
-v0.1.4 的当前重点是稳定人格底色、持续情绪、上下文自然变化与 Agent 零主动错误边界。普通交流倾向简洁，但会根据问题复杂度自然展开；舞台语气仅在明确表演请求或特殊角色话题中启用。
+v0.1.4 的当前重点是稳定人格底色、持续情绪、上下文自然变化、基础应用工具能力与 Agent 零主动错误边界。普通交流倾向简洁，但会根据问题复杂度自然展开；舞台语气仅在明确表演请求或特殊角色话题中启用。应用启动支持首次审批后记住精确路径，后续相同目标可直接启动。
 
 2026-08-11 分离验收结果：Rust 156 项测试通过、Python 28 项测试通过、React/Vite 生产构建通过，并在删除本地 CLI 目录后完成 Desktop 独立启动检查。
 
@@ -95,6 +95,9 @@ v0.1.4 的当前重点是稳定人格底色、持续情绪、上下文自然变�
 - 文件、终端、扫描、测试报告等工具。
 - 危险命令检测、工作区越界检测和私有目录保护。
 - 工具结果验证、失败修复循环和外部修改检测。
+- `app_open` 应用启动：自动寻找可执行文件，首次审批后持久记住精确路径和参数。
+- 应用启动与 `term_run` 分离，避免通过 PowerShell 或 shell 阻塞 Agent 主流程。
+- 每条用户消息拥有独立 Task Context；任务完成、失败、拒绝或异常后都会清理。
 
 ### 模型、视觉与联网
 
@@ -247,6 +250,14 @@ cargo run -p furina-desktop
 
 文件写入、命令执行、越界访问等操作可能触发审批。拒绝后 Agent 会收到拒绝事件，不会执行对应操作。
 
+应用启动流程：
+
+1. 用户要求启动应用后，Agent 只提交应用名称或安全 ID，不直接执行 shell。
+2. Runtime 在 `PATH`、系统目录和常见应用目录中寻找可执行文件；也支持从明确的 `.exe` 路径登记应用。
+3. 首次找到目标时显示应用名称、真实路径和参数，用户批准后才启动。
+4. 批准结果保存在本机 `.furina/approved_apps.json`；后续只有在可执行文件或参数完全一致时免审批。
+5. 目标路径不存在、路径变化或参数变化时重新审批。应用启动不会自动把 `term_run` 命令加入白名单。
+
 ### 记忆与关系
 
 记忆页从 Soul Engine 读取 Desktop 本地记忆摘要。情绪、关系和记忆会持久化到 `.furina/memory`，不会读取历史 CLI 的状态目录。
@@ -293,6 +304,7 @@ Desktop 默认以仓库根目录作为工具工作区。需要操作其他项目
 - `.furina/secrets.env`
 - `.furina/memory/`
 - `.furina/voice/`
+- `.furina/approved_apps.json`
 - `.furina/web_cache/`
 - `.furina/avatar/`
 - `target/`
@@ -304,6 +316,7 @@ Desktop 默认以仓库根目录作为工具工作区。需要操作其他项目
 - 仓库不包含 API key。
 - 仓库不包含用户对话、关系、记忆或本地日志。
 - 仓库不包含第三方角色语音数据或音色模型。
+- 应用白名单只保存在本机，记录用户批准过的应用路径和参数，不上传到 GitHub。
 - 图片、音频和文本只有在相应功能启用时才发送给配置的外部服务。
 - Desktop 的运行数据与历史 CLI 完全分离。
 
@@ -312,6 +325,8 @@ Desktop 默认以仓库根目录作为工具工作区。需要操作其他项目
 - LLM 不直接决定命令是否安全。
 - Rust 权限网关检查危险模式、写操作、工作区边界和私有目录。
 - `.furina` 与 `persona` 被设置为工具私有路径。
+- `app_open` 使用直接进程启动，不把用户提供的路径拼接成 shell 命令。
+- 应用白名单按 `app_id + 精确 executable + 参数` 匹配，安装位置变化会重新请求审批。
 - 写文件前可检测外部并发修改。
 - 多个 Desktop 窗口通过 `.furina/memory/instance.lock` 防止状态覆盖。
 - 测试和工具输出会结构化解析，失败可进入有限修复循环。
@@ -374,6 +389,7 @@ v0.1.2 的 Windows Sandbox 验收流程与历史结果保留在 [docs/RC_ACCEPTA
 - ASR、TTS、LLM、视觉和部分搜索能力依赖第三方服务与网络。
 - Qwen Omni 更适合 ASR；其 TTS 输出不是严格逐字朗读，仅作为实验路径保留。
 - VRM 资产不随仓库发布，需用户自行准备合法资源。
+- 应用自动发现目前以 Windows 常见目录、`PATH` 和明确 executable 路径为主；不提供通用桌面 GUI 自动化。
 - 当前 RC1 已生成未签名 NSIS 安装器和便携 ZIP；Windows SmartScreen 可能提示未知发布者。
 - 当前没有自动更新器，代码签名与自动更新计划在后续版本处理。
 

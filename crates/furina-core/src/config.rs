@@ -12,6 +12,7 @@ pub struct Config {
     pub agent: AgentConfig,
     pub persona: String,
     pub approval: ApprovalConfig,
+    pub tools: ToolsConfig,
     pub ui: UiConfig,
     pub web: WebConfig,
     pub web_cache: WebCacheConfig,
@@ -64,6 +65,23 @@ pub struct ApprovalConfig {
     pub mode: String,
     pub auto_allow: Vec<String>,
     pub danger_patterns: Vec<String>,
+    pub auto_approve_read_only_web: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ToolsConfig {
+    pub safe_apps: Vec<SafeAppConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SafeAppConfig {
+    pub id: String,
+    pub label: String,
+    pub executable: String,
+    pub args: Vec<String>,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -354,6 +372,25 @@ impl Default for ApprovalConfig {
                 "shutdown".into(),
                 ":(){".into(),
             ],
+            auto_approve_read_only_web: true,
+        }
+    }
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self { safe_apps: Vec::new() }
+    }
+}
+
+impl Default for SafeAppConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            label: String::new(),
+            executable: String::new(),
+            args: Vec::new(),
+            enabled: false,
         }
     }
 }
@@ -394,6 +431,7 @@ impl Default for Config {
             agent: AgentConfig::default(),
             persona: "furina".into(),
             approval: ApprovalConfig::default(),
+            tools: ToolsConfig::default(),
             ui: UiConfig::default(),
             web: WebConfig::default(),
             web_cache: WebCacheConfig::default(),

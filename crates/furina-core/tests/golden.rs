@@ -485,8 +485,10 @@ async fn web_search_denied_without_approval() {
         },
     ];
     let llm: Box<dyn LlmClient> = Box::new(FixtureLlm::from_turns(turns, 10));
+    let mut cfg = Config::default();
+    cfg.approval.auto_approve_read_only_web = false;
     let mut agent = Agent::new(
-        Config::default(),
+        cfg,
         ws.clone(),
         sidecar,
         llm,
@@ -511,6 +513,7 @@ async fn web_search_approved_hits_mock_backend() {
     let body = r#"{"results":[{"title":"Rust","url":"https://rust-lang.org","content":"系统编程语言"}]}"#.to_string();
     let addr = spawn_web_mock(body);
     let mut cfg = Config::default();
+    cfg.approval.auto_approve_read_only_web = false;
     cfg.web = furina_core::config::WebConfig {
         search_backend: "tavily".into(),
         api_key_env: "FURINA_TEST_WEB_KEY".into(),
@@ -580,6 +583,7 @@ async fn web_search_auto_approves_after_first_confirm() {
     let body = r#"{"results":[{"title":"R","url":"https://r","content":"c"}]}"#.to_string();
     let addr = spawn_web_mock_loop(body, 2);
     let mut cfg = Config::default();
+    cfg.approval.auto_approve_read_only_web = false;
     cfg.web = furina_core::config::WebConfig {
         search_backend: "tavily".into(),
         api_key_env: "FURINA_TEST_WEB_KEY2".into(),

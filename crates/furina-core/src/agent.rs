@@ -1,7 +1,8 @@
 //! The agent loop: scan → plan → approve → execute → verify → repair,
 //! with hard stop conditions and a structured event stream.
 
-use crate::config::Config;
+use crate::config::{Config, SafeAppConfig};
+use crate::app_launcher::{resolve_app_target, AppApprovalStore};
 use crate::context::{strip_runtime_soul_context, truncate_text, trim_incomplete_turn, ContextManager};
 use crate::gateway::{escapes_workspace, is_private_path, ActionKind, PermissionGateway, Verdict};
 use crate::interaction::{analyze_with_fallback, InteractionAnalyzer};
@@ -56,6 +57,155 @@ impl InteractionMode {
     }
 }
 
+fn normalize_app_key(value: &str) -> String {
+    value.chars().filter(|character| character.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+}
+
+fn safe_app_definition(configured: &[SafeAppConfig], requested: &str) -> Option<SafeAppConfig> {
+    let requested = requested.trim();
+    let requested_key = normalize_app_key(requested);
+    let requested_name = requested.replace('\\', "/").rsplit('/').next().unwrap_or("").to_ascii_lowercase();
+    let is_qq_music = requested_key == "qqmusic" || requested_key == "qq音乐" || requested_name == "qqmusic.exe";
+    let is_qq = requested_key == "qq" || requested_key == "qqim" || requested_key == "qq聊天" || requested_name == "qq.exe";
+    let requested_id = if is_qq_music { "qq_music" } else if is_qq { "qq" } else { requested };
+    let mut app = configured.iter().find(|candidate| normalize_app_key(&candidate.id) == normalize_app_key(requested_id)).cloned();
+    if app.is_none() && is_qq_music {
+        app = Some(SafeAppConfig { id: "qq_music".into(), label: "QQ音乐".into(), executable: String::new(), args: Vec::new(), enabled: true });
+    }
+    if app.is_none() && is_qq {
+        app = Some(SafeAppConfig { id: "qq".into(), label: "QQ".into(), executable: String::new(), args: Vec::new(), enabled: true });
+    }
+    if let Some(mut app) = app {
+        if (is_qq_music && requested_name == "qqmusic.exe") || (is_qq && requested_name == "qq.exe") {
+            app.executable = requested.to_string();
+        }
+        Some(app)
+    } else { None }
+}
+
+fn executable_path_from_command(command: &str) -> Option<String> {
+    let mut candidates = Vec::new();
+    let chars: Vec<char> = command.chars().collect();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '\'' || chars[index] == '"' {
+            let quote = chars[index];
+            index += 1;
+            let begin = index;
+            while index < chars.len() && chars[index] != quote {
+                index += 1;
+            }
+            if begin < index {
+                candidates.push(chars[begin..index].iter().collect::<String>());
+            }
+        }
+        index += 1;
+    }
+    candidates.extend(command.split_whitespace().map(|token| token.trim_matches(['"', '\'']).to_string()));
+    candidates.into_iter().find(|candidate| {
+        let lower = candidate.to_ascii_lowercase();
+        lower.ends_with(".exe") && (candidate.contains('\\') || candidate.contains('/') || candidate.contains(':'))
+    })
+}
+
+fn launch_name_from_command(command: &str) -> Option<String> {
+    let lower = command.to_ascii_lowercase();
+    let has_launch_intent = ["start ", "start\"", "start-process", "open ", "启动", "打开", "运行"]
+        .iter()
+        .any(|marker| lower.contains(marker));
+    if !has_launch_intent {
+        return None;
+    }
+    let mut tokens = command.split_whitespace().map(|token| token.trim_matches(['"', '\'']));
+    while let Some(token) = tokens.next() {
+        let normalized = token.to_ascii_lowercase();
+        if matches!(normalized.as_str(), "start" | "start-process" | "open" | "cmd" | "/c" | "powershell" | "-command") {
+            continue;
+        }
+        if token.starts_with('-') || token.starts_with('/') || token.is_empty() {
+            continue;
+        }
+        if token.eq_ignore_ascii_case("qq") || token.eq_ignore_ascii_case("qqmusic") || !token.contains('=') {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
+fn known_app_request_from_command(configured: &[SafeAppConfig], command: &str) -> Option<String> {
+    let lower = command.to_ascii_lowercase();
+    let has_launch_intent = ["start ", "start\"", "start-process", "open ", "启动", "打开", "运行"]
+        .iter()
+        .any(|marker| lower.contains(marker));
+    let shell_launch_intent = lower.contains("-command") && lower.contains('&');
+    let first_token = lower
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(['"', '\'']);
+    let direct_executable = first_token.ends_with(".exe")
+        && (first_token.contains('\\') || first_token.contains('/') || first_token == "qq.exe" || first_token == "qqmusic.exe");
+    if !has_launch_intent && !shell_launch_intent && !direct_executable {
+        return None;
+    }
+    if let Some(path) = executable_path_from_command(command) {
+        return Some(path);
+    }
+
+    if lower.contains("qqmusic.exe") || lower.contains("qq音乐") || (has_launch_intent && lower.contains("qqmusic")) {
+        return Some("qq_music".into());
+    }
+    if lower.contains("qq.exe") || (has_launch_intent && lower.split(|c: char| !c.is_ascii_alphanumeric()).any(|part| part == "qq")) {
+        return Some("qq".into());
+    }
+
+    if let Some(name) = launch_name_from_command(command) {
+        return Some(name);
+    }
+    configured.iter().find_map(|app| {
+        let executable = app.executable.replace('\\', "/").rsplit('/').next().unwrap_or("").to_ascii_lowercase();
+        if !executable.is_empty() && lower.contains(&executable) {
+            return Some(app.id.clone());
+        }
+        let key = normalize_app_key(&app.id);
+        if has_launch_intent && !key.is_empty() && normalize_app_key(command).contains(&key) {
+            return Some(app.id.clone());
+        }
+        None
+    })
+}
+
+fn dynamic_app_definition(requested: &str) -> Option<SafeAppConfig> {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return None;
+    }
+    let path = std::path::Path::new(requested);
+    if path.is_file() && path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("exe")) {
+        let stem = path.file_stem()?.to_string_lossy().to_string();
+        return Some(SafeAppConfig {
+            id: normalize_app_key(&stem),
+            label: stem,
+            executable: requested.to_string(),
+            args: Vec::new(),
+            enabled: true,
+        });
+    }
+    if requested.contains('\\') || requested.contains('/') || requested.contains(':') || requested.len() > 64 {
+        return None;
+    }
+    let id = normalize_app_key(requested);
+    if id.is_empty() {
+        return None;
+    }
+    Some(SafeAppConfig {
+        id,
+        label: requested.to_string(),
+        executable: String::new(),
+        args: Vec::new(),
+        enabled: true,
+    })
+}
 fn classify_interaction_mode(text: &str) -> InteractionMode {
     let lower = text.to_lowercase();
     const TECHNICAL_MARKERS: &[&str] = &[
@@ -132,7 +282,10 @@ pub struct Agent {
     web: Result<WebClient, String>,
     web_cache: Option<WebCache>,
     context: ContextManager,
-    transcript: Vec<ChatMessage>,
+    conversation: Vec<ChatMessage>,
+    task_transcript: Vec<ChatMessage>,
+    current_task_user: Option<String>,
+    app_approvals: AppApprovalStore,
     state: AgentState,
     repair_rounds: u32,
     steps: u32,
@@ -170,7 +323,7 @@ impl Agent {
             .unwrap_or_else(|_| cfg.model.clone());
         Self {
             model,
-            workspace,
+            workspace: workspace.clone(),
             cfg,
             sidecar,
             llm,
@@ -186,7 +339,10 @@ impl Agent {
             web,
             web_cache: None,
             context,
-            transcript: Vec::new(),
+            conversation: Vec::new(),
+            task_transcript: Vec::new(),
+            current_task_user: None,
+            app_approvals: AppApprovalStore::load(workspace.clone().join(".furina/approved_apps.json")),
             state: AgentState::Idle,
             repair_rounds: 0,
             steps: 0,
@@ -200,9 +356,10 @@ impl Agent {
         }
     }
 
-    /// Clear session state (used for one-shot `run`; chat keeps it).
+    /// Clear all session state. Soul and Memory are owned by the prompt provider.
     pub fn reset(&mut self) {
-        self.transcript.clear();
+        self.conversation.clear();
+        self.clear_task_context();
         self.state = AgentState::Idle;
         self.repair_rounds = 0;
         self.steps = 0;
@@ -242,16 +399,74 @@ impl Agent {
 
     /// 当前会话转录快照（供会话结束后的记忆抽取使用）。
     pub fn transcript_snapshot(&self) -> Vec<ChatMessage> {
-        self.transcript.clone()
+        self.conversation.clone()
+    }
+
+    pub fn set_approved_apps_path(&mut self, path: PathBuf) {
+        self.app_approvals = AppApprovalStore::load(path);
+    }
+
+    fn begin_task(&mut self, task: &str) {
+        self.clear_task_context();
+        self.current_task_user = Some(task.to_string());
+        self.task_transcript.push(ChatMessage::System { content: self.system_prompt.clone() });
+        self.task_transcript.extend(self.conversation.iter().cloned());
+        self.task_transcript.push(ChatMessage::User { content: format!("任务：{task}") });
+    }
+
+    fn clear_task_context(&mut self) {
+        self.task_transcript.clear();
+        self.current_task_user = None;
+        self.known_hashes.clear();
+        self.repair_rounds = 0;
+        self.steps = 0;
+        self.total_tokens = 0;
+        self.wrote_files = false;
+        self.verified = false;
+        self.web_approved = false;
+        self.test_command.clear();
+        self.scanned = false;
+        self.pending_scan = None;
+    }
+
+    fn remember_conversation(&mut self, assistant: &str) {
+        if let Some(user) = self.current_task_user.take() {
+            self.conversation.push(ChatMessage::User { content: user });
+        }
+        if !assistant.trim().is_empty() {
+            self.conversation.push(ChatMessage::Assistant { content: Some(assistant.to_string()), tool_calls: None });
+        }
+        if self.conversation.len() > 4 {
+            let keep_from = self.conversation.len() - 4;
+            self.conversation.drain(..keep_from);
+        }
+    }
+
+    fn fail_task(&mut self, error: &str) {
+        self.state = AgentState::Failed;
+        self.emit_state();
+        self.emit(Event::Done { success: false, summary: error.to_string() });
+        self.clear_task_context();
     }
 
     pub async fn run_task(&mut self, task: &str) -> anyhow::Result<TaskOutcome> {
+        self.begin_task(task);
+        match self.run_task_inner(task).await {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                self.fail_task(&error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    async fn run_task_inner(&mut self, task: &str) -> anyhow::Result<TaskOutcome> {
         // 丢弃上一轮被中断留下的未完成回合，保证发给 LLM 的消息序列合法。
-        trim_incomplete_turn(&mut self.transcript);
+        trim_incomplete_turn(&mut self.task_transcript);
         let interaction_mode = classify_interaction_mode(task);
         let semantic_analysis = if interaction_mode == InteractionMode::Chat {
             if let Some(analyzer) = self.interaction_analyzer.as_deref() {
-                let recent_dialogue = recent_dialogue(&self.transcript, 4);
+                let recent_dialogue = recent_dialogue(&self.conversation, 4);
                 analyze_with_fallback(
                     analyzer,
                     task,
@@ -280,12 +495,6 @@ impl Agent {
             model: self.model.clone(),
         });
 
-        if self.transcript.is_empty() {
-            self.transcript.push(ChatMessage::System { content: self.system_prompt.clone() });
-            self.transcript.push(ChatMessage::User { content: format!("任务：{task}") });
-        } else {
-            self.transcript.push(ChatMessage::User { content: format!("新任务：{task}") });
-        }
 
         let tools = self.llm_tools();
         let mut final_text = String::new();
@@ -304,7 +513,7 @@ impl Agent {
                 .map(|p| p.context_block_for(interaction_mode.as_str()))
                 .filter(|s| !s.is_empty())
                 .unwrap_or_default();
-            let mut messages = self.context.fit(&self.transcript);
+            let mut messages = self.context.fit(&self.task_transcript);
             append_current_context(&mut messages, &current_context);
             // 流式 LLM：增量文本实时发射 MessageDelta（UI 打字机 + 逐句语音），
             // 完整内容仍在返回后写入转录（上下文/记忆/日志语义不变）。
@@ -329,7 +538,7 @@ impl Agent {
             });
 
             let has_tools = !resp.tool_calls.is_empty();
-            self.transcript.push(ChatMessage::Assistant {
+            self.task_transcript.push(ChatMessage::Assistant {
                 content: resp.content.clone(),
                 tool_calls: if has_tools { Some(resp.tool_calls.clone()) } else { None },
             });
@@ -489,16 +698,20 @@ impl Agent {
             }
             "term_run" => {
                 let command = args.get("command").and_then(Value::as_str).unwrap_or("").to_string();
-                match self.gateway.check(&ActionKind::RunCommand { command: command.clone() }) {
-                    Verdict::Allow => self.run_term(&command, args).await,
-                    Verdict::RequireApproval => {
-                        if self.ask_approval("运行命令", &command).await {
-                            self.run_term(&command, args).await
-                        } else {
-                            Ok(json!({"denied": true, "message": "用户拒绝执行命令"}))
+                if let Some(requested) = known_app_request_from_command(&self.cfg.tools.safe_apps, &command) {
+                    self.open_safe_app(&requested).await
+                } else {
+                    match self.gateway.check(&ActionKind::RunCommand { command: command.clone() }) {
+                        Verdict::Allow => self.run_term(&command, args).await,
+                        Verdict::RequireApproval => {
+                            if self.ask_approval("运行命令", &command).await {
+                                self.run_term(&command, args).await
+                            } else {
+                                Ok(json!({"denied": true, "message": "用户拒绝执行命令"}))
+                            }
                         }
+                        Verdict::Block(reason) => Ok(json!({"blocked": reason})),
                     }
-                    Verdict::Block(reason) => Ok(json!({"blocked": reason})),
                 }
             }
             "git_commit" => {
@@ -509,9 +722,13 @@ impl Agent {
                     Ok(json!({"denied": true, "message": "用户拒绝提交"}))
                 }
             }
+            "app_open" => {
+                let requested = args.get("app_id").and_then(Value::as_str).unwrap_or("").trim();
+                self.open_safe_app(requested).await
+            }
             "web_search" => {
                 let query = args.get("query").and_then(Value::as_str).unwrap_or("").to_string();
-                if self.web_approved || self.ask_approval("联网搜索", &query).await {
+                if self.cfg.approval.auto_approve_read_only_web || self.web_approved || self.ask_approval("联网搜索", &query).await {
                     self.web_approved = true;
                     match &self.web {
                         Ok(client) => match client.search(&query).await {
@@ -541,7 +758,7 @@ impl Agent {
             }
             "web_open" => {
                 let url = args.get("url").and_then(Value::as_str).unwrap_or("").to_string();
-                if self.web_approved || self.ask_approval("打开网页", &url).await {
+                if self.cfg.approval.auto_approve_read_only_web || self.web_approved || self.ask_approval("打开网页", &url).await {
                     self.web_approved = true;
                     match &self.web {
                         Ok(client) => match client.open(&url).await {
@@ -578,14 +795,14 @@ impl Agent {
                 if (name == "fs_write_file" || name == "fs_create_file") && ok {
                     self.wrote_files = true;
                 }
-                self.transcript.push(ChatMessage::Tool {
+                self.task_transcript.push(ChatMessage::Tool {
                     tool_call_id: call.id.clone(),
                     content: format!("{scan_prefix}{}", truncate_text(&summary, self.cfg.llm.tool_output_truncate)),
                 });
             }
             Err(e) => {
                 self.emit(Event::ToolResult { name: name.clone(), ok: false, summary: e.clone() });
-                self.transcript.push(ChatMessage::Tool {
+                self.task_transcript.push(ChatMessage::Tool {
                     tool_call_id: call.id.clone(),
                     content: format!("{scan_prefix}{}", truncate_text(&e, self.cfg.llm.tool_output_truncate)),
                 });
@@ -594,6 +811,53 @@ impl Agent {
         Ok(())
     }
 
+    async fn open_safe_app(&mut self, requested: &str) -> Result<Value, String> {
+        match safe_app_definition(&self.cfg.tools.safe_apps, requested)
+            .or_else(|| dynamic_app_definition(requested))
+        {
+            None => Err(format!("未登记的应用 ID：{requested}")),
+            Some(app) if !app.enabled => Ok(json!({
+                "denied": true,
+                "message": format!("应用已禁用：{}", app.label),
+                "app_id": app.id,
+            })),
+            Some(app) => match resolve_app_target(&app) {
+                None => Ok(json!({
+                    "denied": true,
+                    "message": format!("未找到{}的可执行文件，请确认应用已安装", app.label),
+                    "app_id": app.id,
+                })),
+                Some(app) if !self.app_approvals.is_approved(&app) => {
+                    let args_text = if app.args.is_empty() { "（无）".to_string() } else { app.args.join(" ") };
+                    let detail = format!(
+                        "应用：{}\napp_id：{}\n已解析启动路径：{}\n启动参数：{}",
+                        app.label, app.id, app.executable, args_text
+                    );
+                    if !self.ask_approval("启动应用", &detail).await {
+                        Ok(json!({"denied": true, "message": "用户拒绝启动应用", "app_id": app.id}))
+                    } else {
+                        self.app_approvals
+                            .approve(&app)
+                            .map_err(|error| error.to_string())
+                            .and_then(|_| self.app_approvals.launch(&app).map(|_| json!({
+                                "started": true,
+                                "app_id": app.id,
+                                "label": app.label,
+                                "executable": app.executable,
+                                "approval": "remembered",
+                            })).map_err(|error| error.to_string()))
+                    }
+                }
+                Some(app) => self.app_approvals.launch(&app).map(|_| json!({
+                    "started": true,
+                    "app_id": app.id,
+                    "label": app.label,
+                    "executable": app.executable,
+                    "approval": "remembered",
+                })).map_err(|error| error.to_string()),
+            },
+        }
+    }
     async fn run_term(&mut self, command: &str, args: Value) -> Result<Value, String> {
         let is_test = self.gateway.is_test_command(command);
         if is_test {
@@ -650,7 +914,7 @@ impl Agent {
             self.state = AgentState::Repairing;
             self.emit(Event::Verify { passed: false, detail: detail.clone() });
         }
-        self.transcript.push(ChatMessage::User {
+        self.task_transcript.push(ChatMessage::User {
             content: format!("[自动验证] 运行 {command}：\n{detail}"),
         });
         Ok(())
@@ -767,6 +1031,11 @@ impl Agent {
                 parameters: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}),
             },
             ToolSpec {
+                name: "app_open".into(),
+                description: "启动应用名称或 ID（如 qq_music、QQ、微信、notepad）；运行时自动寻找可执行文件，首次启动需审批，批准后记住精确路径".into(),
+                parameters: json!({"type":"object","properties":{"app_id":{"type":"string"}},"required":["app_id"]}),
+            },
+            ToolSpec {
                 name: "web_search".into(),
                 description: "联网搜索（需用户审批）：返回标题/链接/摘要".into(),
                 parameters: json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}),
@@ -794,13 +1063,18 @@ impl Agent {
         self.state = if success { AgentState::Done } else { AgentState::Failed };
         self.emit_state();
         self.emit(Event::Done { success, summary: summary.clone() });
-        Ok(TaskOutcome {
+        let outcome = TaskOutcome {
             success,
-            summary,
+            summary: summary.clone(),
             steps: self.steps,
             repair_rounds: self.repair_rounds,
             total_tokens: self.total_tokens,
-        })
+        };
+        if success {
+            self.remember_conversation(&summary);
+        }
+        self.clear_task_context();
+        Ok(outcome)
     }
 }
 
@@ -897,5 +1171,60 @@ mod tests {
         assert!(external_change_warning(Some("aaa"), Some("aaa")).is_none());
         assert!(external_change_warning(None, Some("bbb")).is_none());
         assert!(external_change_warning(Some("aaa"), None).is_none());
+    }
+
+    #[test]
+    fn qq_music_alias_accepts_a_discovered_path_candidate() {
+        let app = safe_app_definition(&[], "C:\\Apps\\QQMusic\\QQMusic.exe").unwrap();
+        assert_eq!(app.id, "qq_music");
+        assert_eq!(app.executable, "C:\\Apps\\QQMusic\\QQMusic.exe");
+    }
+
+    #[test]
+    fn qq_alias_accepts_a_direct_executable_path() {
+        let app = safe_app_definition(&[], "C:\\Apps\\QQ\\QQ.exe").unwrap();
+        assert_eq!(app.id, "qq");
+        assert_eq!(app.executable, "C:\\Apps\\QQ\\QQ.exe");
+    }
+
+    #[test]
+    fn launch_commands_are_routed_to_the_safe_app_flow() {
+        let configured = vec![SafeAppConfig {
+            id: "qq".into(),
+            label: "QQ".into(),
+            executable: String::new(),
+            args: Vec::new(),
+            enabled: true,
+        }];
+        assert_eq!(known_app_request_from_command(&configured, r#"start "" C:\Apps\QQ\QQ.exe"#), Some(r#"C:\Apps\QQ\QQ.exe"#.into()));
+        assert_eq!(known_app_request_from_command(&configured, "Start-Process QQ"), Some("qq".into()));
+        assert_eq!(known_app_request_from_command(&configured, "powershell -Command \"& 'C:\\Apps\\QQ\\QQ.exe'\""), Some("C:\\Apps\\QQ\\QQ.exe".into()));
+        assert!(known_app_request_from_command(&configured, "cargo test").is_none());
+        assert!(known_app_request_from_command(&configured, "dir \"C:\\Apps\\QQ\\QQ.exe\"").is_none());
+        assert!(known_app_request_from_command(&configured, "taskkill /im QQ.exe").is_none());
+    }
+    #[test]
+    fn dynamic_app_definition_accepts_existing_executable_path() {
+        let root = std::env::temp_dir().join(format!("furina_dynamic_app_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("Example.exe");
+        std::fs::write(&executable, b"test").unwrap();
+        let app = dynamic_app_definition(&executable.display().to_string()).unwrap();
+        assert_eq!(app.id, "example");
+        assert_eq!(app.executable, executable.display().to_string());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unknown_app_name_can_be_resolved_without_configuration() {
+        let app = dynamic_app_definition("notepad").unwrap();
+        assert_eq!(app.id, "notepad");
+        assert!(app.executable.is_empty());
+    }
+
+    #[test]
+    fn unknown_app_alias_is_rejected() {
+        assert!(safe_app_definition(&[], "unknown_app").is_none());
     }
 }

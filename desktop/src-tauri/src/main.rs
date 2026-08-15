@@ -69,7 +69,7 @@ impl EventSink for DesktopSink {
                 if let Some(interjector) = &self.interjector { interjector.reset_budget(); }
             }
             Event::ToolCall { .. } => *self.used_tools.lock().unwrap() = true,
-            Event::Done { .. } => *self.agent_state.lock().unwrap() = "idle".into(),
+
             _ => {}
         }
         if let Some(sender) = &self.interject_tx {
@@ -206,16 +206,36 @@ async fn ensure_agent(state: &State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 async fn chat_send(state: State<'_, AppState>, text: String) -> Result<(), String> {
-    {
-        let mut status = state.agent_state.lock().map_err(|error| error.to_string())?;
-        if *status != "idle" { return Err("Furina 正在处理上一条消息".into()); }
-        *status = "starting".into();
+    let wait_started = std::time::Instant::now();
+    loop {
+        let became_active = {
+            let mut status = state.agent_state.lock().map_err(|error| error.to_string())?;
+            if *status == "idle" {
+                *status = "starting".into();
+                true
+            } else {
+                false
+            }
+        };
+        if became_active {
+            break;
+        }
+        if wait_started.elapsed() > std::time::Duration::from_secs(30) {
+            return Err("Furina 仍在处理上一条消息，请稍后再试".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     if let Err(error) = ensure_agent(&state).await {
         *state.agent_state.lock().unwrap() = "idle".into();
         return Err(error);
     }
-    let mut agent = state.agent.lock().map_err(|error| error.to_string())?.take().ok_or("Agent 未初始化")?;
+    let mut agent = match state.agent.lock().map_err(|error| error.to_string())?.take() {
+        Some(agent) => agent,
+        None => {
+            *state.agent_state.lock().unwrap() = "idle".into();
+            return Err("Agent 未初始化".into());
+        }
+    };
     let result = agent.run_task(&text).await;
     *state.agent.lock().map_err(|error| error.to_string())? = Some(agent);
     *state.agent_state.lock().unwrap() = "idle".into();

@@ -263,6 +263,7 @@ pub async fn build_agent(
     );
     // Soul 私有边界：人格配置 / 记忆 / 密钥目录对 LLM 工具不可读写。
     agent.set_private_paths(vec![paths.resource_root.join("persona"), paths.data_root.join(".furina")]);
+    agent.set_approved_apps_path(paths.data_root.join(".furina/approved_apps.json"));
     agent.set_prompt_context(Box::new(SoulProvider(soul)));
     if let Some(interaction_analyzer) = interaction_analyzer {
         agent.set_interaction_analyzer(Box::new(interaction_analyzer), interaction_analyzer_timeout_ms);
