@@ -264,6 +264,9 @@ export class AvatarActionScheduler {
     } else if (intent.type === "behavior_action") {
       candidates = [intent.action];
       key = `behavior:${intent.action}`;
+    } else if (intent.type === "motion") {
+      candidates = [intent.action];
+      key = `motion:${intent.motion || intent.action}`;
     } else if (intent.type === "pointer_click") {
       candidates = CLICK_ACTIONS[intent.zone] || CLICK_ACTIONS.body;
       key = `click:${intent.zone || "body"}`;

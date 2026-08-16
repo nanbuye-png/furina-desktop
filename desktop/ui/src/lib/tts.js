@@ -1,8 +1,18 @@
+import { audioLevelFromTimeDomain, smoothAudioLevel } from "./audioLevel.js";
+
 // TTS 预合成管线：合成端边收边合成、播放端顺序播放（句间 280ms 自然停顿）。
 // stop() 递增令牌，使在途合成结果作废，避免旧语音重新入队。
 
 export class TtsPipeline {
-  constructor({ invoke, emotionFor, speedFor, voiceProfileFor, onStatus, onSpeaking }) {
+  constructor({
+    invoke,
+    emotionFor,
+    speedFor,
+    voiceProfileFor,
+    onStatus,
+    onSpeaking,
+    onAudioLevel,
+  }) {
     this.invoke = invoke;
     this.emotionFor = emotionFor;
     this.speedFor = speedFor;
@@ -12,13 +22,23 @@ export class TtsPipeline {
     }));
     this.onStatus = onStatus || (() => {});
     this.onSpeaking = onSpeaking || (() => {});
+    this.onAudioLevel = onAudioLevel || (() => {});
     this.ttsQueue = [];
     this.playQueue = [];
     this.playing = false;
     this.synthesizing = false;
     this.synthToken = 0;
     this.currentAudio = null;
+    this.currentPlaybackResolve = null;
     this.enabled = true;
+    this.audioContext = null;
+    this.audioSource = null;
+    this.audioAnalyser = null;
+    this.audioLevelBuffer = null;
+    this.audioLevel = 0;
+    this.audioLevelFrame = null;
+    this.audioAnalysisActive = false;
+    this.lastAudioSampleAt = 0;
   }
 
   speak(text) {
@@ -54,9 +74,9 @@ export class TtsPipeline {
         if (!this.enabled || token !== this.synthToken) break;
         this.playQueue.push({ text, res });
         this.kickPlay();
-      } catch (e) {
+      } catch (error) {
         if (!this.enabled || token !== this.synthToken) break;
-        this.onStatus("⚠️ 语音合成失败：" + (e && e.message ? e.message : e));
+        this.onStatus("⚠️ 语音合成失败：" + (error && error.message ? error.message : error));
       }
     }
     this.synthesizing = false;
@@ -81,6 +101,7 @@ export class TtsPipeline {
         const blob = new Blob([new Uint8Array(res.data)], { type: mime });
         url = URL.createObjectURL(blob);
         this.currentAudio = new Audio(url);
+        this.startAudioAnalysis(this.currentAudio);
         await new Promise((resolve, reject) => {
           let settled = false;
           const finish = (error) => {
@@ -95,11 +116,12 @@ export class TtsPipeline {
           this.currentAudio.onerror = () => finish(new Error("浏览器音频播放失败"));
           this.currentAudio.play().catch((error) => finish(error));
         });
-        await new Promise((r) => setTimeout(r, 280));
-      } catch (e) {
+        await new Promise((resolve) => setTimeout(resolve, 280));
+      } catch (error) {
         if (!this.enabled) break;
-        this.onStatus("⚠️ 语音播放失败：" + (e && e.message ? e.message : e));
+        this.onStatus("⚠️ 语音播放失败：" + (error && error.message ? error.message : error));
       } finally {
+        this.stopAudioAnalysis();
         if (this.currentAudio) {
           this.currentAudio.pause();
           this.currentAudio = null;
@@ -112,16 +134,95 @@ export class TtsPipeline {
     if (this.playQueue.length > 0) this.kickPlay();
   }
 
+  startAudioAnalysis(audio) {
+    this.stopAudioAnalysis(false);
+    const AudioContextClass = globalThis.AudioContext || globalThis.webkitAudioContext;
+    if (!AudioContextClass) return false;
+    try {
+      if (!this.audioContext || this.audioContext.state === "closed") {
+        this.audioContext = new AudioContextClass();
+      }
+      const analyser = this.audioContext.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.55;
+      const source = this.audioContext.createMediaElementSource(audio);
+      source.connect(analyser);
+      analyser.connect(this.audioContext.destination);
+      this.audioSource = source;
+      this.audioAnalyser = analyser;
+      this.audioLevelBuffer = new Uint8Array(analyser.fftSize);
+      this.audioLevel = 0;
+      this.audioAnalysisActive = true;
+      this.lastAudioSampleAt = performance.now();
+      if (this.audioContext.state === "suspended") {
+        this.audioContext.resume().catch(() => {});
+      }
+      this.sampleAudioLevel();
+      return true;
+    } catch (_) {
+      this.stopAudioAnalysis();
+      return false;
+    }
+  }
+
+  sampleAudioLevel = () => {
+    if (!this.audioAnalysisActive || !this.audioAnalyser || !this.audioLevelBuffer) return;
+    this.audioAnalyser.getByteTimeDomainData(this.audioLevelBuffer);
+    const currentTime = performance.now();
+    const delta = Math.min(Math.max((currentTime - this.lastAudioSampleAt) / 1000, 1 / 240), 0.1);
+    this.lastAudioSampleAt = currentTime;
+    const rawLevel = audioLevelFromTimeDomain(this.audioLevelBuffer);
+    this.audioLevel = smoothAudioLevel(this.audioLevel, rawLevel, delta);
+    this.onAudioLevel(this.audioLevel);
+    if (typeof globalThis.requestAnimationFrame === "function") {
+      this.audioLevelFrame = globalThis.requestAnimationFrame(this.sampleAudioLevel);
+    } else {
+      this.audioLevelFrame = setTimeout(this.sampleAudioLevel, 16);
+    }
+  };
+
+  stopAudioAnalysis(notify = true) {
+    this.audioAnalysisActive = false;
+    if (this.audioLevelFrame !== null) {
+      if (typeof globalThis.cancelAnimationFrame === "function") {
+        globalThis.cancelAnimationFrame(this.audioLevelFrame);
+      } else {
+        clearTimeout(this.audioLevelFrame);
+      }
+      this.audioLevelFrame = null;
+    }
+    try {
+      this.audioSource?.disconnect();
+    } catch (_) {}
+    try {
+      this.audioAnalyser?.disconnect();
+    } catch (_) {}
+    this.audioSource = null;
+    this.audioAnalyser = null;
+    this.audioLevelBuffer = null;
+    this.audioLevel = 0;
+    if (notify) this.onAudioLevel(0);
+  }
+
   stop() {
     if (this.currentPlaybackResolve) this.currentPlaybackResolve();
     if (this.currentAudio) {
       this.currentAudio.pause();
       this.currentAudio = null;
     }
+    this.stopAudioAnalysis();
     this.ttsQueue = [];
     this.playQueue = [];
     this.playing = false;
     this.synthToken++;
     this.onSpeaking(false);
+  }
+
+  dispose() {
+    this.stop();
+    if (this.audioContext && this.audioContext.state !== "closed") {
+      this.audioContext.close().catch(() => {});
+    }
+    this.audioContext = null;
   }
 }

@@ -117,3 +117,14 @@ describe("VrmAvatarProvider interaction context", () => {
     expect(() => provider.applyPoseBone("leftUpperArm", 0, 0, -1.2, 1)).not.toThrow();
   });
 });
+
+describe("VrmAvatarProvider audio state", () => {
+  it("clamps live audio levels before the renderer consumes them", () => {
+    const provider = providerHarness();
+
+    provider.setAudioLevel(2);
+    expect(provider.context.audioLevel).toBe(1);
+    provider.setAudioLevel(-1);
+    expect(provider.context.audioLevel).toBe(0);
+  });
+});

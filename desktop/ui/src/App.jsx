@@ -1,14 +1,15 @@
-import React, { useEffect, useReducer, useRef, useState } from "react";
+import React, { lazy, Suspense, useEffect, useReducer, useRef, useState } from "react";
 import { invoke, listen } from "./lib/tauri.js";
 import { StreamBuffer } from "./lib/streaming.js";
 import { projectEmotions } from "./lib/projection.js";
 import { PcmRecorder } from "./lib/asr.js";
 import { TtsPipeline } from "./lib/tts.js";
 import { VoiceEmotionController } from "./lib/voiceEmotion.js";
-import AvatarStage from "./avatar/AvatarStage.jsx";
 import { moodReactionFor } from "./avatar/avatarBehavior.js";
 import { conversationStateFor } from "./avatar/avatarInteraction.js";
-import SetupWizard from "./SetupWizard.jsx";
+
+const AvatarStage = lazy(() => import("./avatar/AvatarStage.jsx"));
+const SetupWizard = lazy(() => import("./SetupWizard.jsx"));
 
 const MOOD_LABELS = {
   calm: "淡定",
@@ -94,8 +95,9 @@ export default function App() {
       voiceProfileFor: () => voiceEmotionRef.current.next(soulRef.current, speedRef.current),
       onStatus: (s) => pushMsg({ kind: "status", text: s }),
       onSpeaking: setTtsSpeaking,
+      onAudioLevel: (level) => avatarRef.current?.setAudioLevel(level),
     });
-    return () => ttsRef.current?.stop();
+    return () => ttsRef.current?.dispose();
   }, []);
   useEffect(() => {
     if (ttsRef.current) ttsRef.current.enabled = voiceOn;
@@ -511,19 +513,21 @@ export default function App() {
         </div>
       </header>
 
-      <AvatarStage
-        ref={avatarRef}
-        mood={soul?.mood || "calm"}
-        moodLabel={MOOD_LABELS[soul?.mood || "calm"]}
-        intensity={expr.intensity}
-        valence={expr.valence}
-        arousal={expr.arousal}
-        speaking={speaking || silentTalking}
-        recording={recording}
-        thinking={thinking}
-        conversationState={conversationState}
-        interactionBlocked={Boolean(approval)}
-      />
+      <Suspense fallback={<AvatarLoading />}>
+        <AvatarStage
+          ref={avatarRef}
+          mood={soul?.mood || "calm"}
+          moodLabel={MOOD_LABELS[soul?.mood || "calm"]}
+          intensity={expr.intensity}
+          valence={expr.valence}
+          arousal={expr.arousal}
+          speaking={speaking || silentTalking}
+          recording={recording}
+          thinking={thinking}
+          conversationState={conversationState}
+          interactionBlocked={Boolean(approval)}
+        />
+      </Suspense>
 
       <div className="content">
         <section className="conversation">
@@ -581,17 +585,39 @@ export default function App() {
       {thinking && <div className="thinking">💭 Furina 正在思考中…</div>}
       {recording && <div className="thinking rec">🎙️ 正在听…松开发送</div>}
       {showSetup && setupStatus && (
-        <SetupWizard
-          initialStatus={setupStatus}
-          onUpdated={setSetupStatus}
-          onClose={() => setShowSetup(false)}
-        />
+        <Suspense fallback={<SetupLoading />}>
+          <SetupWizard
+            initialStatus={setupStatus}
+            onUpdated={setSetupStatus}
+            onClose={() => setShowSetup(false)}
+          />
+        </Suspense>
       )}
     </div>
   );
 }
 
 // ---------- 子组件 ----------
+
+function AvatarLoading() {
+  return (
+    <main className="avatar-stage avatar-stage-loading" aria-busy="true">
+      <div className="avatar-placeholder">正在加载 Avatar…</div>
+    </main>
+  );
+}
+
+function SetupLoading() {
+  return (
+    <div className="setup-overlay" aria-busy="true">
+      <div className="setup-shell">
+        <div className="setup-card">
+          <div className="setup-empty">正在加载设置…</div>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function Message({ m }) {
   if (m.kind === "status") return <div className="status">{m.text}</div>;

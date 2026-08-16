@@ -46,6 +46,7 @@ export class VrmAvatarProvider {
       valence: 0.5,
       arousal: 0.5,
       speaking: false,
+      audioLevel: 0,
       recording: false,
       thinking: false,
       blocked: false,
@@ -120,6 +121,10 @@ export class VrmAvatarProvider {
 
   setState(nextState) {
     this.setInteractionContext(nextState);
+  }
+
+  setAudioLevel(level) {
+    this.context.audioLevel = THREE.MathUtils.clamp(Number(level) || 0, 0, 1);
   }
 
   setInteractionContext(nextContext) {
@@ -338,9 +343,9 @@ export class VrmAvatarProvider {
     }
     this.applyExpression("blink", blink, delta, immediate);
 
-    this.mouthElapsed += delta;
+    const audioLevel = THREE.MathUtils.clamp(Number(this.context.audioLevel) || 0, 0, 1);
     const mouth = this.context.speaking
-      ? 0.18 + Math.abs(Math.sin(this.mouthElapsed * 11.5)) * 0.48
+      ? THREE.MathUtils.clamp(0.04 + audioLevel * 1.05, 0, 0.95)
       : 0;
     this.applyExpression("aa", mouth, delta, immediate);
   }

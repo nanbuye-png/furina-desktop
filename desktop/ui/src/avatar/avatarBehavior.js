@@ -1,3 +1,4 @@
+import { resolveMotion, MOTION_LIBRARY } from "./avatarMotion.js";
 export const AVATAR_MODES = Object.freeze({
   idle: "idle",
   listening: "listening",
@@ -49,7 +50,7 @@ export class AvatarBehaviorController {
     return {
       mode: this.mode,
       activeModes: new Set(this.activeModes),
-      pending: this.pending?.behavior || null,
+      pending: this.pending?.motion || this.pending?.behavior || null,
       cooldowns: new Map(this.cooldowns),
     };
   }
@@ -101,6 +102,24 @@ export class AvatarBehaviorController {
     return this.trigger(kind);
   }
 
+  motion(name) {
+    const definition = resolveMotion(name);
+    if (!definition) return null;
+    const currentTime = this.now();
+    const request = {
+      behavior: `motion:${definition.name}`,
+      motion: definition.name,
+      action: definition.action,
+      priority: definition.priority,
+    };
+    if ((this.cooldowns.get(request.behavior) || 0) > currentTime) return null;
+    if (this.mode !== AVATAR_MODES.idle && !definition.immediate) {
+      this.pending = request;
+      return { accepted: true, queued: true, behavior: definition.name };
+    }
+    return this.execute(request, definition, currentTime);
+  }
+
   observeMood(mood) {
     if (!mood || mood === this.lastMood) return null;
     const previous = this.lastMood;
@@ -125,9 +144,10 @@ export class AvatarBehaviorController {
 
   execute(request, definition, currentTime = this.now()) {
     const result = this.requestAction({
-      type: "behavior_action",
+      type: request.motion ? "motion" : "behavior_action",
+      motion: request.motion || null,
       action: request.action,
-      priority: 50,
+      priority: request.priority || 50,
     });
     if (result?.deferred) {
       this.pending = request;
@@ -151,7 +171,7 @@ export class AvatarBehaviorController {
     if (this.mode !== AVATAR_MODES.idle || !this.pending) return null;
     const request = this.pending;
     this.pending = null;
-    const definition = TRANSIENT_BEHAVIORS[request.behavior];
+    const definition = TRANSIENT_BEHAVIORS[request.behavior] || (request.motion ? MOTION_LIBRARY[request.motion] : null);
     const result = this.execute(request, definition);
     if (!result) this.pending = request;
     return result;

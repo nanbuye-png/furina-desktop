@@ -98,3 +98,40 @@ describe("AvatarBehaviorController", () => {
     expect(controller.observeMood("calm")).toBeNull();
   });
 });
+
+describe("Avatar named motions", () => {
+  it("resolves a named motion into a scheduler intent", () => {
+    let intent;
+    const controller = new AvatarBehaviorController({
+      requestAction: (nextIntent) => {
+        intent = nextIntent;
+        return { action: nextIntent.action };
+      },
+      now: () => 0,
+    });
+
+    expect(controller.motion("nod")).toEqual({
+      accepted: true,
+      queued: false,
+      behavior: "motion:nod",
+      action: "head_nod",
+    });
+    expect(intent).toMatchObject({ type: "motion", motion: "nod", action: "head_nod" });
+  });
+
+  it("rejects unknown motions and queues safe motions while busy", () => {
+    const controller = new AvatarBehaviorController({
+      requestAction: (intent) => ({ action: intent.action }),
+      now: () => 0,
+    });
+
+    expect(controller.motion("not-a-motion")).toBeNull();
+    controller.think(true);
+    expect(controller.motion("sway")).toEqual({
+      accepted: true,
+      queued: true,
+      behavior: "sway",
+    });
+    expect(controller.getSnapshot().pending).toBe("sway");
+  });
+});

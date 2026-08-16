@@ -51,7 +51,7 @@ const AvatarStage = forwardRef(function AvatarStage({
     const call = (name, ...args) => {
       const behavior = behaviorRef.current;
       if (behavior) return behavior[name](...args);
-      if (["acknowledge", "greet", "farewell", "react"].includes(name)) {
+      if (["acknowledge", "greet", "farewell", "react", "motion"].includes(name)) {
         queuedBehaviorsRef.current.push({ name, args });
         return { accepted: true, queued: true, behavior: name };
       }
@@ -65,6 +65,8 @@ const AvatarStage = forwardRef(function AvatarStage({
       greet: () => call("greet"),
       farewell: () => call("farewell"),
       react: (kind) => call("react", kind),
+      motion: (name) => call("motion", name),
+      setAudioLevel: (level) => providerRef.current?.setAudioLevel(level),
       reset: () => {
         queuedBehaviorsRef.current = [];
         return behaviorRef.current?.reset() ?? false;
