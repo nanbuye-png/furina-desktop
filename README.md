@@ -8,7 +8,7 @@ Furina Desktop 是 Furina Personal AI Lifeform 的独立桌面实现。她不只
 
 项目原则：**人格是灵魂，Runtime 是大脑，工具是双手，安全是边界，验证是生命线。**
 
-历史 Furina Agent CLI 已冻结在 [nanbuye-png/furina-agent](https://github.com/nanbuye-png/furina-agent) 的 Tag/Release 中；本仓库自 v0.1.1 起是唯一后续开发主线。Desktop v0.1.2 已完成功能验收，当前为 **Desktop v0.1.4 开发版**，已包含 Persona v2.0、持续情绪、事实记忆、情绪语音映射，以及基础工具审批与应用启动记忆；不读取或共享 CLI 的本地历史数据。
+历史 Furina Agent CLI 已冻结在 [nanbuye-png/furina-agent](https://github.com/nanbuye-png/furina-agent) 的 Tag/Release 中；本仓库自 v0.1.1 起是唯一后续开发主线。当前为 **Desktop v0.1.4 Agent Runtime 强化开发版**，已包含 Persona v2.0、持续情绪、事实记忆、情绪语音映射、基础工具审批与应用启动记忆，以及长任务恢复、自身只读检查、经验学习和受控自身改进提案；不读取或共享 CLI 的本地历史数据。
 
 ## 目录
 
@@ -33,7 +33,7 @@ Furina Desktop 是 Furina Personal AI Lifeform 的独立桌面实现。她不只
 
 | 项目 | 状态 |
 | --- | --- |
-| 当前版本 | **Desktop v0.1.4（应用审批与任务隔离更新）** |
+| 当前版本 | **Desktop v0.1.4（Agent Runtime 强化开发版）** |
 | 开发主线 | 本仓库 `main` |
 | 桌面框架 | Tauri 2 |
 | 前端 | React 18 + Vite 5 |
@@ -44,9 +44,9 @@ Furina Desktop 是 Furina Personal AI Lifeform 的独立桌面实现。她不只
 | Desktop 独立启动 | 已验证 |
 | CLI 数据共享 | **不共享** |
 
-v0.1.4 的当前重点是稳定人格底色、持续情绪、上下文自然变化、基础应用工具能力与 Agent 零主动错误边界。普通交流倾向简洁，但会根据问题复杂度自然展开；舞台语气仅在明确表演请求或特殊角色话题中启用。应用启动支持首次审批后记住精确路径，后续相同目标可直接启动。
+v0.1.4 的当前重点是稳定人格底色、持续情绪、上下文自然变化、基础应用工具能力与 Agent 零主动错误边界。普通交流倾向简洁，但会根据问题复杂度自然展开；舞台语气仅在明确表演请求或特殊角色话题中启用。应用启动支持首次审批后记住精确路径，后续相同目标可直接启动。Agent Runtime 已加入长任务软检查点、自动续跑、停滞检测、任务恢复与非幂等动作防重放；自身检查严格限制为脱敏只读访问，经验库和自身改进提案均不绕过用户审批。
 
-2026-08-11 分离验收结果：Rust 156 项测试通过、Python 28 项测试通过、React/Vite 生产构建通过，并在删除本地 CLI 目录后完成 Desktop 独立启动检查。
+2026-08-16 验收结果：Rust workspace 全量测试、Python Sidecar 29 项测试、Desktop UI 58 项测试和 React/Vite 生产构建均通过；已覆盖超过 64 次工具调用、任务恢复、防重放、自身检查、脱敏审计、诊断导出与提案回滚场景。
 
 ## 项目定位
 
@@ -403,18 +403,23 @@ v0.1.2 的 Windows Sandbox 验收流程与历史结果保留在 [docs/RC_ACCEPTA
 
 ## 路线图
 
-- [x] Desktop 与历史 CLI 代码、Git 和运行数据完全分离
-- [x] React + Vite + Tauri 2 桌面主界面
-- [x] 文本对话、ASR、TTS 和可打断播放
-- [x] Soul 状态、记忆与关系面板
-- [x] 工具审批与 Agent Runtime
-- [x] Three.js + VRM Avatar 接入
-- [x] 独立 GitHub 仓库、Tag 和 v0.1.1 Release
-- [ ] Avatar 口型同步和动作系统
-- [ ] 安装包、自动更新与发布流水线
-- [ ] UI 性能与前端 bundle 拆分
-- [ ] 跨平台验证
-- [ ] 更完善的 Desktop 设置界面
+| 状态 | 目标 |
+| --- | --- |
+| ✅ 已完成 | Desktop 与历史 CLI 代码、Git 和运行数据完全分离 |
+| ✅ 已完成 | React + Vite + Tauri 2 桌面主界面 |
+| ✅ 已完成 | 文本对话、ASR、TTS 和可打断播放 |
+| ✅ 已完成 | Soul 状态、记忆与关系面板 |
+| ✅ 已完成 | 工具审批与 Agent Runtime |
+| ✅ 已完成 | 长任务检查点、自动续跑、任务恢复与 Agent 自我迭代闭环 |
+| ✅ 已完成 | Three.js + VRM Avatar 接入 |
+| ✅ 已完成 | 独立 GitHub 仓库、`desktop-v0.1.1` Tag 和 Release |
+| 🟡 进行中 | Avatar 音频能量级口型同步和完整 Motion 动作系统 |
+| 🟡 进行中 | 安装包、自动更新、代码签名与发布门禁 |
+| 🟡 进行中 | 更完善的 Desktop 设置、诊断和提案管理界面 |
+| ⬜ 待开始 | UI 性能优化与前端 bundle 拆分 |
+| ⬜ 待开始 | macOS / Linux 系统级验证与跨平台发布 |
+
+下一阶段优先级：**真实长任务稳定性与恢复演练 → Avatar 音频级口型和 Motion → 自动更新与代码签名 → UI bundle 拆分 → macOS/Linux 验证**。
 
 ## 历史 CLI
 
