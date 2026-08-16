@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$ExecutablePath = "target/release/furina-desktop.exe",
-    [string]$OutputPath = "dist/Furina-Desktop-0.1.2-x64-Portable.zip"
+    [string]$OutputPath = "dist/Furina-Desktop-0.1.4-x64-Portable.zip"
 )
 
 $ErrorActionPreference = "Stop"
