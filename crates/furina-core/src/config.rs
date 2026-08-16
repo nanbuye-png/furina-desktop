@@ -55,8 +55,17 @@ pub struct ProviderConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AgentConfig {
-    pub max_repair_rounds: u32,
-    pub max_steps_per_task: u32,
+    pub checkpoint_interval_steps: u32,
+    pub max_repeated_tool_calls: u32,
+    pub max_stalled_checkpoints: u32,
+    pub repair_review_after: u32,
+    pub self_inspection_enabled: bool,
+    pub experience_learning_enabled: bool,
+    pub self_change_proposals_enabled: bool,
+    #[serde(default, skip_serializing)]
+    pub max_repair_rounds: Option<u32>,
+    #[serde(default, skip_serializing)]
+    pub max_steps_per_task: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -338,7 +347,17 @@ impl Default for EmotionClassifierConfig {
 
 impl Default for AgentConfig {
     fn default() -> Self {
-        Self { max_repair_rounds: 3, max_steps_per_task: 50 }
+        Self {
+            checkpoint_interval_steps: 32,
+            max_repeated_tool_calls: 3,
+            max_stalled_checkpoints: 2,
+            repair_review_after: 3,
+            self_inspection_enabled: true,
+            experience_learning_enabled: true,
+            self_change_proposals_enabled: true,
+            max_repair_rounds: None,
+            max_steps_per_task: None,
+        }
     }
 }
 
@@ -543,7 +562,10 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.model, "deepseek-chat");
         assert_eq!(cfg.llm.api_key_env, "FURINA_API_KEY");
-        assert_eq!(cfg.agent.max_repair_rounds, 3);
+        assert_eq!(cfg.agent.checkpoint_interval_steps, 32);
+        assert_eq!(cfg.agent.max_repeated_tool_calls, 3);
+        assert_eq!(cfg.agent.max_stalled_checkpoints, 2);
+        assert_eq!(cfg.agent.repair_review_after, 3);
         assert!(cfg.approval.auto_allow.iter().any(|a| a == "pytest"));
         assert_eq!(cfg.ui.mode, "chat");
         assert_eq!(cfg.web.search_backend, "none");
@@ -563,6 +585,22 @@ mod tests {
         let p = cfg.active_provider().unwrap();
         assert_eq!(p.id, "deepseek");
         assert_eq!(p.base_url, "https://api.deepseek.com");
+    }
+
+    #[test]
+    fn legacy_agent_limits_deserialize_but_are_not_serialized() {
+        let cfg: Config = serde_yaml::from_str(r#"
+agent:
+  max_repair_rounds: 3
+  max_steps_per_task: 50
+"#).unwrap();
+        assert_eq!(cfg.agent.max_repair_rounds, Some(3));
+        assert_eq!(cfg.agent.max_steps_per_task, Some(50));
+        assert_eq!(cfg.agent.checkpoint_interval_steps, 32);
+        let serialized = serde_yaml::to_string(&cfg).unwrap();
+        assert!(!serialized.contains("max_steps_per_task"));
+        assert!(!serialized.contains("max_repair_rounds"));
+        assert!(serialized.contains("checkpoint_interval_steps"));
     }
 
     #[test]

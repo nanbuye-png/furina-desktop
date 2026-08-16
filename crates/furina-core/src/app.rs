@@ -4,9 +4,13 @@
 //! `.furina/` 状态目录、人格系统提示）完全一致。
 
 use crate::agent::{Agent, Approver, PromptContextProvider};
+use crate::audit::AuditLog;
 use crate::config::Config;
 use crate::interaction::HttpInteractionAnalyzer;
+use crate::experience::AgentExperienceStore;
+use crate::task_journal::TaskJournalStore;
 use crate::llm::{DeepSeekClient, LlmClient};
+use crate::self_inspect::SelfInspector;
 use crate::sidecar::{EventSink, Sidecar, SidecarLaunch};
 use crate::web_cache::WebCache;
 use furina_proto::Event;
@@ -19,9 +23,12 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
 pub struct RuntimePaths {
+    pub mode: String,
     pub resource_root: PathBuf,
     pub data_root: PathBuf,
     pub workspace_root: PathBuf,
+    pub source_root: Option<PathBuf>,
+    pub self_manifest_path: PathBuf,
     pub sidecar: SidecarLaunch,
 }
 
@@ -32,6 +39,8 @@ impl RuntimePaths {
     pub fn voice_dir(&self) -> PathBuf { self.data_root.join(".furina/voice") }
     pub fn web_cache_dir(&self) -> PathBuf { self.data_root.join(".furina/web_cache") }
     pub fn avatar_dir(&self) -> PathBuf { self.data_root.join(".furina/avatar") }
+    pub fn agent_dir(&self) -> PathBuf { self.data_root.join(".furina/agent") }
+    pub fn proposals_dir(&self) -> PathBuf { self.data_root.join(".furina/proposals") }
 }
 
 pub fn soul_dir(root: &Path) -> PathBuf {
@@ -252,18 +261,46 @@ pub async fn build_agent(
         sink.clone(),
     )
     .await?;
+    let self_inspector = SelfInspector::new(
+        paths.mode.clone(),
+        paths.source_root.clone(),
+        paths.self_manifest_path.clone(),
+        paths.workspace_root.clone(),
+        sidecar.version().to_string(),
+        cfg.clone(),
+        paths.config_path(),
+        paths.proposals_dir(),
+    );
+    let experience_store = AgentExperienceStore::open(&paths.agent_dir());
+    let task_journal = TaskJournalStore::open(&paths.agent_dir());
+    let recovery = task_journal.summary();
+    let audit_log = AuditLog::open(&paths.agent_dir());
     let mut agent = Agent::new(
         cfg,
         paths.workspace_root.clone(),
         sidecar,
         llm,
-        sink,
+        sink.clone(),
         approver,
         system_prompt,
     );
     // Soul 私有边界：人格配置 / 记忆 / 密钥目录对 LLM 工具不可读写。
     agent.set_private_paths(vec![paths.resource_root.join("persona"), paths.data_root.join(".furina")]);
     agent.set_approved_apps_path(paths.data_root.join(".furina/approved_apps.json"));
+    agent.set_self_inspector(self_inspector);
+    agent.set_experience_store(experience_store);
+    agent.set_task_journal(task_journal);
+    agent.set_audit_log(audit_log);
+    if let Some(recovery) = recovery {
+        sink.emit(Event::TaskRecoveryAvailable {
+            task_id: recovery.task_id,
+            goal: recovery.goal,
+            status: recovery.status,
+            checkpoint_count: recovery.checkpoint_count,
+            steps: recovery.steps,
+            updated_at_ms: recovery.updated_at_ms,
+        });
+    }
     agent.set_prompt_context(Box::new(SoulProvider(soul)));
     if let Some(interaction_analyzer) = interaction_analyzer {
         agent.set_interaction_analyzer(Box::new(interaction_analyzer), interaction_analyzer_timeout_ms);

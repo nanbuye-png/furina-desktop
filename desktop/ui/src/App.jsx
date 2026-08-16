@@ -224,6 +224,58 @@ export default function App() {
           if (!ev.passed)
             pushMsg({ kind: "status", text: "⚠️ 验证未通过" });
           break;
+        case "checkpoint":
+          setToolLog((log) =>
+            [...log, `[检查点 #${ev.sequence || "?"}] ${ev.reason || "progress"} · ${ev.steps || 0} 步`].slice(-200)
+          );
+          pushMsg({
+            kind: "status",
+            text: `⏳ 长任务检查点 #${ev.sequence || "?"}：已执行 ${ev.steps || 0} 步，正在继续…`,
+          });
+          break;
+        case "experience_learned":
+          setToolLog((log) =>
+            [...log, `[经验] ${ev.summary || ev.id || "已记录"}`].slice(-200)
+          );
+          break;
+        case "self_change_proposed":
+          pushMsg({
+            kind: "status",
+            text: `🧭 已生成自身改进提案：${ev.summary || ev.id || "待审阅"}`,
+          });
+          break;
+        case "self_change_applied":
+          pushMsg({
+            kind: "status",
+            text: ev.success
+              ? `✅ 自身改进提案已应用：${ev.summary || ev.id || "完成"}`
+              : `⚠️ 自身改进提案未应用：${ev.summary || ev.id || "验证失败并已回滚"}`,
+          });
+          break;
+        case "task_recovery_available":
+          pushMsg({
+            kind: "status",
+            text: `⏯️ 检测到未完成任务（${ev.steps || 0} 步，${ev.status || "可恢复"}）。发送“继续上次任务”即可恢复。`,
+          });
+          setToolLog((log) =>
+            [...log, `[恢复] ${ev.goal || ev.task_id || "发现可恢复任务"}`].slice(-200)
+          );
+          break;
+        case "task_recovery_resumed":
+          pushMsg({
+            kind: "status",
+            text: `▶️ 已恢复上次任务，从检查点继续（${ev.steps || 0} 步）。`,
+          });
+          break;
+        case "task_recovery_discarded":
+          pushMsg({ kind: "status", text: "🧹 已放弃上次未完成任务，开始处理当前请求。" });
+          break;
+        case "diagnostic_exported":
+          pushMsg({
+            kind: "status",
+            text: `🧾 已导出脱敏诊断：${ev.path || "完成"}`,
+          });
+          break;
         case "approval_required":
           // 审批弹窗已经提供明确反馈，不在聊天区重复显示流程胶囊。
           break;
@@ -377,6 +429,15 @@ export default function App() {
     }
   }
 
+  async function exportDiagnostics() {
+    try {
+      const path = await invoke("export_diagnostics");
+      pushMsg({ kind: "status", text: `🧾 诊断已导出：${path}` });
+    } catch (error) {
+      pushMsg({ kind: "status", text: "⚠️ 诊断导出失败：" + error });
+    }
+  }
+
   // 情绪投影（spec §6，前端 Desktop Layer 计算）
   const expr = projectEmotions(soul?.emotions || {}, soul?.mood || "calm");
   const conversationState = conversationStateFor({
@@ -427,6 +488,7 @@ export default function App() {
         </div>
         <div className="controls">
           <button className="settings-button" onClick={openSettings} disabled={recording || thinking || Boolean(approval)}>设置</button>
+          <button className="settings-button" onClick={exportDiagnostics} disabled={recording || Boolean(approval)}>诊断</button>
           <label className="toggle">
             <input
               type="checkbox"

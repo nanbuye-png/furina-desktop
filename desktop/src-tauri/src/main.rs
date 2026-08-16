@@ -12,6 +12,7 @@ use furina_core::agent::{Agent, Approver};
 use furina_core::app::{self, InstanceLock, RuntimePaths};
 use furina_core::asr::AsrClient;
 use furina_core::config::{Config, EmotionClassifierConfig, ProviderConfig};
+use furina_core::diagnostics;
 use furina_core::interject::{InterjectCtx, Interjector};
 use furina_core::sidecar::{EventSink, Sidecar};
 use furina_core::voice::{VoiceClient, VoiceSynthesisProfile};
@@ -970,6 +971,21 @@ async fn doctor(state: State<'_, AppState>) -> Result<serde_json::Value, String>
     }))
 }
 
+#[tauri::command]
+async fn export_diagnostics(state: State<'_, AppState>) -> Result<String, String> {
+    let paths = state.paths.read().map_err(|error| error.to_string())?.clone();
+    let config = state.services.lock().map_err(|error| error.to_string())?.config.clone();
+    let output = tokio::task::spawn_blocking(move || diagnostics::export(&paths, &config, None))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    let path = output.display().to_string();
+    let event = serde_json::to_value(Event::DiagnosticExported { path: path.clone() })
+        .map_err(|error| error.to_string())?;
+    let _ = state.app.emit("furina-event", event);
+    Ok(path)
+}
+
 struct DoctorSink;
 
 impl EventSink for DoctorSink {
@@ -1026,6 +1042,7 @@ fn main() {
             chat_send, transcribe, tts_synthesize, stop_speaking, approval_respond, get_soul_state,
             get_memories, get_avatar_asset_info, load_avatar_asset, doctor, get_setup_status, save_setup,
             validate_provider, reload_runtime, import_avatar, detect_legacy_data, migrate_legacy_data,
+            export_diagnostics,
         ])
         .run(tauri::generate_context!())
         .expect("Furina Desktop 启动失败");

@@ -5,9 +5,12 @@ use furina_core::agent::{Agent, Approver, PromptContextProvider};
 use furina_core::config::{Config, ProviderConfig};
 use furina_core::llm::{FixtureLlm, LlmClient, LlmResponse};
 use furina_core::sidecar::{EventSink, Sidecar, SidecarLaunch};
+use furina_core::task_journal::{CompletedAction, TaskCheckpointRecord, TaskJournalStore, TASK_JOURNAL_SCHEMA_VERSION};
 use furina_core::web_cache::WebCache;
 use furina_proto::{ChatMessage, Event, ToolCall, ToolFunctionCall, ToolSpec};
+use sha2::{Digest, Sha256};
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -222,6 +225,17 @@ fn test_call() -> ToolCall {
     }
 }
 
+fn tool_fingerprint(name: &str, arguments: &str) -> String {
+    let normalized = serde_json::from_str::<serde_json::Value>(arguments)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| arguments.split_whitespace().collect::<Vec<_>>().join(" "));
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    hasher.update(b":");
+    hasher.update(normalized.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 #[tokio::test]
 async fn golden_repair_loop_fixes_calculator() {
     if !python_available() {
@@ -254,51 +268,282 @@ async fn golden_repair_loop_fixes_calculator() {
 }
 
 #[tokio::test]
-async fn repair_budget_exhaustion_fails_cleanly() {
+async fn repair_rounds_beyond_legacy_limit_can_recover() {
     if !python_available() {
         eprintln!("skip: python 不可用");
         return;
     }
     let ws = temp_fixture_ws();
     let broken = std::fs::read_to_string(ws.join("calculator.py")).unwrap();
+    let fixed = format!("{}\n# repaired by long-loop regression\n", broken.replace("return a - b", "return a + b"));
     let sink = Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new()))));
     let sidecar = spawn_sidecar(&ws, sink.clone()).await;
-    let turns: Vec<LlmResponse> = (0..4)
-        .map(|i| LlmResponse {
-            content: Some(format!("第 {i} 次修复尝试")),
+    let mut turns: Vec<LlmResponse> = (0..4)
+        .map(|index| LlmResponse {
+            content: Some(format!("第 {index} 次修复尝试")),
             tool_calls: vec![write_call(&broken), test_call()],
             prompt_tokens: 10,
             completion_tokens: 10,
         })
         .collect();
+    for index in 0..3 {
+        turns.push(LlmResponse {
+            content: Some(format!("换一种修复方案 {index}")),
+            tool_calls: vec![write_call(&fixed), test_call()],
+            prompt_tokens: 10,
+            completion_tokens: 10,
+        });
+    }
+    turns.extend((0..3).map(|_| LlmResponse {
+        content: Some("修复完成".into()),
+        tool_calls: vec![],
+        prompt_tokens: 10,
+        completion_tokens: 10,
+    }));
     let llm: Box<dyn LlmClient> = Box::new(FixtureLlm::from_turns(turns, 10));
     let mut agent = Agent::new(
-        Config::default(),
-        ws.clone(),
-        sidecar,
-        llm,
-        sink.clone(),
-        Box::new(AutoApprove),
+        Config::default(), ws.clone(), sidecar, llm, sink.clone(), Box::new(AutoApprove),
         "你是测试用的 agent。".into(),
     );
 
-    let outcome = agent.run_task("修复测试失败").await;
+    let outcome = agent.run_task("修复测试失败").await.unwrap();
+    assert!(outcome.success, "超过旧修复轮数后仍应允许恢复: {}", outcome.summary);
+    assert!(outcome.repair_rounds >= 4);
+    assert!(std::fs::read_to_string(ws.join("calculator.py")).unwrap().contains("return a + b"));
     let _ = std::fs::remove_dir_all(&ws);
+}
 
-    match outcome {
-        Ok(o) => {
-            assert!(!o.success, "修复轮数耗尽后应失败");
-            assert!(o.summary.contains("修复轮数"));
-        }
-        Err(e) => {
-            let events = sink.0.lock().unwrap();
-            eprintln!("run_task 错误: {e:#}");
-            for ev in events.iter() {
-                eprintln!("  {ev:?}");
-            }
-            panic!("run_task 应返回 outcome 而不是错误");
-        }
+#[tokio::test]
+async fn more_than_sixty_four_tool_calls_continue_with_checkpoints() {
+    if !python_available() {
+        eprintln!("skip: python 不可用");
+        return;
     }
+    let ws = temp_fixture_ws();
+    let sink = Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new()))));
+    let sidecar = spawn_sidecar(&ws, sink.clone()).await;
+    let mut turns = (0..65)
+        .map(|index| LlmResponse {
+            content: Some(format!("检查第 {index} 项")),
+            tool_calls: vec![ToolCall {
+                id: format!("search_{index}"),
+                r#type: "function".into(),
+                function: ToolFunctionCall {
+                    name: "fs_search".into(),
+                    arguments: serde_json::json!({"pattern": format!("never-match-{index}")}).to_string(),
+                },
+            }],
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        })
+        .collect::<Vec<_>>();
+    turns.push(LlmResponse {
+        content: Some("长任务检查完成".into()),
+        tool_calls: vec![],
+        prompt_tokens: 1,
+        completion_tokens: 1,
+    });
+    let llm: Box<dyn LlmClient> = Box::new(FixtureLlm::from_turns(turns, 1));
+    let mut agent = Agent::new(
+        Config::default(), ws.clone(), sidecar, llm, sink.clone(), Box::new(AutoApprove),
+        "你是测试用的 agent。".into(),
+    );
+
+    let outcome = agent.run_task("执行长时间项目检查").await.unwrap();
+    assert!(outcome.success);
+    assert_eq!(outcome.steps, 65);
+    assert!(outcome.checkpoint_count >= 2);
+    let events = sink.0.lock().unwrap();
+    assert!(events.iter().filter(|event| matches!(event, Event::Checkpoint { .. })).count() >= 2);
+    drop(events);
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+#[tokio::test]
+async fn token_budget_checkpoint_can_stop_cleanly() {
+    if !python_available() {
+        eprintln!("skip: python 不可用");
+        return;
+    }
+    let ws = temp_fixture_ws();
+    let sink = Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new()))));
+    let sidecar = spawn_sidecar(&ws, sink.clone()).await;
+    let turns = vec![LlmResponse {
+        content: Some("先检查".into()),
+        tool_calls: vec![ToolCall {
+            id: "budget_search".into(), r#type: "function".into(),
+            function: ToolFunctionCall { name: "fs_search".into(), arguments: serde_json::json!({"pattern":"missing"}).to_string() },
+        }],
+        prompt_tokens: 1, completion_tokens: 1,
+    }];
+    let mut config = Config::default();
+    config.llm.max_total_tokens = 2;
+    let mut agent = Agent::new(
+        config, ws.clone(), sidecar,
+        Box::new(FixtureLlm::from_turns(turns, 1)), sink.clone(), Box::new(DenyApprove),
+        "你是测试用的 agent。".into(),
+    );
+
+    let outcome = agent.run_task("预算测试").await.unwrap();
+    assert!(!outcome.success);
+    assert_eq!(outcome.stop_reason.as_deref(), Some("budget_declined"));
+    assert!(sink.0.lock().unwrap().iter().any(|event| matches!(event, Event::Checkpoint { reason, .. } if reason == "token_budget")));
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+#[tokio::test]
+async fn resumed_task_skips_completed_non_idempotent_action() {
+    if !python_available() {
+        eprintln!("skip: python 不可用");
+        return;
+    }
+    let ws = temp_fixture_ws();
+    let original = std::fs::read_to_string(ws.join("calculator.py")).unwrap();
+    let repeated_call = write_call("this content must not be replayed");
+    let fingerprint = tool_fingerprint("fs_write_file", &repeated_call.function.arguments);
+    let agent_dir = ws.join(".furina/agent");
+    let journal = TaskJournalStore::open(&agent_dir);
+    journal.save(&TaskCheckpointRecord {
+        schema_version: TASK_JOURNAL_SCHEMA_VERSION,
+        task_id: "task_resume_test".into(),
+        original_goal: "继续修复 calculator".into(),
+        status: "checkpoint".into(),
+        checkpoint_count: 2,
+        steps: 7,
+        total_tokens: 20,
+        repair_rounds: 1,
+        token_budget_limit: 100_000,
+        summary: "写入动作已成功，等待确认当前状态".into(),
+        blocking: "无".into(),
+        wrote_files: true,
+        verified: true,
+        test_command: String::new(),
+        scanned: true,
+        known_hashes: BTreeMap::new(),
+        completed_actions: vec![CompletedAction {
+            fingerprint,
+            tool: "fs_write_file".into(),
+            result_fingerprint: "result".into(),
+            summary: "先前写入已成功".into(),
+            completed_at_ms: 1,
+        }],
+        failure_evidence: Vec::new(),
+        tool_patterns: vec!["fs_write_file".into()],
+        app_version: env!("CARGO_PKG_VERSION").into(),
+        updated_at_ms: 1,
+    }).unwrap();
+    let sink = Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new()))));
+    let sidecar = spawn_sidecar(&ws, sink.clone()).await;
+    let turns = vec![
+        LlmResponse {
+            content: Some("检查是否需要重复写入".into()),
+            tool_calls: vec![repeated_call],
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        },
+        LlmResponse {
+            content: Some("恢复完成".into()),
+            tool_calls: vec![],
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        },
+    ];
+    let mut agent = Agent::new(
+        Config::default(), ws.clone(), sidecar, Box::new(FixtureLlm::from_turns(turns, 1)),
+        sink.clone(), Box::new(AutoApprove), "你是测试用的 agent。".into(),
+    );
+    agent.set_task_journal(journal.clone());
+
+    let outcome = agent.run_task("继续上次任务").await.unwrap();
+    assert!(outcome.success);
+    assert_eq!(std::fs::read_to_string(ws.join("calculator.py")).unwrap(), original);
+    assert!(journal.load().is_none(), "成功恢复后应清除 active journal");
+    let events = sink.0.lock().unwrap();
+    assert!(events.iter().any(|event| matches!(event, Event::TaskRecoveryResumed { task_id, .. } if task_id == "task_resume_test")));
+    assert!(events.iter().any(|event| matches!(event, Event::ToolResult { name, summary, .. } if name == "fs_write_file" && summary.contains("already_completed"))));
+    drop(events);
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+#[tokio::test]
+async fn declining_recovery_discards_saved_task_without_running_llm() {
+    if !python_available() {
+        eprintln!("skip: python 不可用");
+        return;
+    }
+    let ws = temp_fixture_ws();
+    let agent_dir = ws.join(".furina/agent");
+    let journal = TaskJournalStore::open(&agent_dir);
+    journal.save(&TaskCheckpointRecord {
+        schema_version: TASK_JOURNAL_SCHEMA_VERSION,
+        task_id: "task_decline_test".into(),
+        original_goal: "不应继续的任务".into(),
+        status: "paused".into(),
+        checkpoint_count: 1,
+        steps: 3,
+        total_tokens: 5,
+        repair_rounds: 0,
+        token_budget_limit: 100,
+        summary: "等待恢复".into(),
+        blocking: "等待用户".into(),
+        wrote_files: false,
+        verified: false,
+        test_command: String::new(),
+        scanned: false,
+        known_hashes: BTreeMap::new(),
+        completed_actions: Vec::new(),
+        failure_evidence: Vec::new(),
+        tool_patterns: Vec::new(),
+        app_version: env!("CARGO_PKG_VERSION").into(),
+        updated_at_ms: 1,
+    }).unwrap();
+    let sink = Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new()))));
+    let sidecar = spawn_sidecar(&ws, sink.clone()).await;
+    let mut agent = Agent::new(
+        Config::default(), ws.clone(), sidecar,
+        Box::new(FixtureLlm::from_turns(Vec::new(), 1)), sink.clone(), Box::new(DenyApprove),
+        "你是测试用的 agent。".into(),
+    );
+    agent.set_task_journal(journal.clone());
+
+    let outcome = agent.run_task("恢复").await.unwrap();
+    assert!(!outcome.success);
+    assert_eq!(outcome.stop_reason.as_deref(), Some("recovery_declined"));
+    assert!(journal.load().is_none());
+    assert!(sink.0.lock().unwrap().iter().any(|event| matches!(event, Event::TaskRecoveryDiscarded { task_id } if task_id == "task_decline_test")));
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+#[tokio::test]
+async fn repeated_identical_tool_results_trigger_stall_review() {
+    if !python_available() {
+        eprintln!("skip: python 不可用");
+        return;
+    }
+    let ws = temp_fixture_ws();
+    let sink = Arc::new(CollectSink(Arc::new(Mutex::new(Vec::new()))));
+    let sidecar = spawn_sidecar(&ws, sink.clone()).await;
+    let turns = (0..6).map(|index| LlmResponse {
+        content: Some(format!("重复检查 {index}")),
+        tool_calls: vec![ToolCall {
+            id: format!("repeat_{index}"), r#type: "function".into(),
+            function: ToolFunctionCall { name: "fs_search".into(), arguments: serde_json::json!({"pattern":"same-never-match"}).to_string() },
+        }],
+        prompt_tokens: 1, completion_tokens: 1,
+    }).collect();
+    let mut config = Config::default();
+    config.agent.max_repeated_tool_calls = 3;
+    config.agent.max_stalled_checkpoints = 1;
+    let mut agent = Agent::new(
+        config, ws.clone(), sidecar, Box::new(FixtureLlm::from_turns(turns, 1)),
+        sink.clone(), Box::new(DenyApprove), "你是测试用的 agent。".into(),
+    );
+
+    let outcome = agent.run_task("检测死循环").await.unwrap();
+    assert!(!outcome.success);
+    assert_eq!(outcome.stop_reason.as_deref(), Some("stalled"));
+    assert!(outcome.checkpoint_count >= 2);
+    let _ = std::fs::remove_dir_all(&ws);
 }
 
 #[tokio::test]

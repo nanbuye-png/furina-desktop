@@ -279,7 +279,7 @@ cargo run -p furina-desktop
 | 配置段 | 作用 |
 | --- | --- |
 | `llm` | 默认模型、多提供方、温度和 token 限制 |
-| `agent` | 最大步骤数与修复轮数 |
+| `agent` | 长任务检查点、停滞检测、自身检查和经验学习 |
 | `approval` | 自动允许命令和危险模式 |
 | `web` | 搜索后端、回退后端和结果数量 |
 | `web_cache` | 网页缓存保留策略 |
@@ -288,6 +288,12 @@ cargo run -p furina-desktop
 | `asr` | ASR provider、语言和 endpoint |
 | `qwen` | Qwen ASR/TTS 模型与音色 |
 | `interject` | 人格化插话开关、预算和温度 |
+
+### Agent 长任务与自身迭代
+
+`agent.checkpoint_interval_steps` 默认每 32 次工具调用生成一次软检查点并自动续跑，不再以固定工具步数终止任务。重复工具结果和连续无进展检查点会触发重新规划；token 预算耗尽时由用户决定是否扩展预算。
+
+开发模式可通过只读白名单检查 Furina 自身源码；安装模式只提供版本、能力清单和脱敏配置。任务经验保存在 `.furina/agent/experience.jsonl`，自身改进提案保存在 `.furina/proposals/`。自身源码或类型化 Agent 配置的实际修改始终需要用户逐次审批，安装模式只导出提案。
 
 ### 模型提供方
 
@@ -307,6 +313,8 @@ Desktop 默认以仓库根目录作为工具工作区。需要操作其他项目
 - `.furina/approved_apps.json`
 - `.furina/web_cache/`
 - `.furina/avatar/`
+- `.furina/agent/`
+- `.furina/proposals/`
 - `target/`
 - `desktop/ui/node_modules/`
 - `desktop/ui/dist/`

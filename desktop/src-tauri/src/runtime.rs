@@ -100,9 +100,12 @@ pub fn resolve(app_handle: &tauri::AppHandle) -> anyhow::Result<ResolvedRuntime>
     fs::create_dir_all(&workspace_root)?;
 
     let paths = RuntimePaths {
+        mode: mode.clone(),
         resource_root: resource_root.clone(),
         data_root: data_root.clone(),
         workspace_root: workspace_root.clone(),
+        source_root: (mode == "development").then(|| resource_root.clone()),
+        self_manifest_path: resource_root.join("self-manifest.json"),
         sidecar: sidecar.clone(),
     };
     let info = RuntimeInfo {
@@ -161,6 +164,8 @@ fn seed_data(resource_root: &Path, data_root: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(furina_dir.join("avatar"))?;
     fs::create_dir_all(furina_dir.join("voice"))?;
     fs::create_dir_all(furina_dir.join("web_cache"))?;
+    fs::create_dir_all(furina_dir.join("agent"))?;
+    fs::create_dir_all(furina_dir.join("proposals"))?;
     let config_path = furina_dir.join("config.yaml");
     if !config_path.exists() {
         let candidates = [

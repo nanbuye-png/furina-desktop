@@ -1,28 +1,33 @@
 //! The agent loop: scan → plan → approve → execute → verify → repair,
 //! with hard stop conditions and a structured event stream.
 
+use crate::audit::AuditLog;
 use crate::config::{Config, SafeAppConfig};
 use crate::app_launcher::{resolve_app_target, AppApprovalStore};
+use crate::experience::{AgentExperienceStore, TaskTrace};
 use crate::context::{strip_runtime_soul_context, truncate_text, trim_incomplete_turn, ContextManager};
 use crate::gateway::{escapes_workspace, is_private_path, ActionKind, PermissionGateway, Verdict};
 use crate::interaction::{analyze_with_fallback, InteractionAnalyzer};
 use crate::llm::LlmClient;
+use crate::self_inspect::{SelfChangeInput, SelfInspector};
 use crate::sidecar::Sidecar;
 use crate::state::AgentState;
+use crate::task_journal::{sanitize_text as sanitize_journal_text, CompletedAction, TaskCheckpointRecord, TaskJournalStore, TaskRecoverySummary, TASK_JOURNAL_SCHEMA_VERSION};
 use crate::web::WebClient;
 use crate::web_cache::{WebCache, WebCacheEntry};
 use async_trait::async_trait;
 use furina_proto::{ChatMessage, Event, ScanResult, TaskOutcome, ToolCall, ToolSpec};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 #[async_trait]
 pub trait Approver: Send {
     async fn confirm(&mut self, prompt: &str) -> bool;
 }
-
 /// 人格上下文提供者：Soul Engine 实现此 trait，核心在构建 LLM 消息时调用。
 /// 纯人格层——只提供语气与行为倾向，永不触碰权限/工具执行。
 pub trait PromptContextProvider: Send + Sync {
@@ -281,10 +286,17 @@ pub struct Agent {
     known_hashes: HashMap<String, String>,
     web: Result<WebClient, String>,
     web_cache: Option<WebCache>,
+    self_inspector: Option<SelfInspector>,
+    experience_store: Option<AgentExperienceStore>,
+    task_journal: Option<TaskJournalStore>,
+    audit_log: Option<AuditLog>,
     context: ContextManager,
     conversation: Vec<ChatMessage>,
     task_transcript: Vec<ChatMessage>,
     current_task_user: Option<String>,
+    current_task_id: Option<String>,
+    completed_actions: HashMap<String, CompletedAction>,
+    resumed_from_checkpoint: bool,
     app_approvals: AppApprovalStore,
     state: AgentState,
     repair_rounds: u32,
@@ -296,6 +308,18 @@ pub struct Agent {
     test_command: String,
     scanned: bool,
     pending_scan: Option<String>,
+    checkpoint_count: u32,
+    token_budget_limit: u64,
+    last_tool_signature: String,
+    last_tool_result_digest: String,
+    repeated_tool_calls: u32,
+    progress_revision: u64,
+    checkpoint_progress_revision: u64,
+    stalled_checkpoints: u32,
+    last_repair_reviewed: u32,
+    tool_patterns: HashSet<String>,
+    failure_evidence: Vec<String>,
+    stop_reason: Option<String>,
 }
 
 impl Agent {
@@ -338,10 +362,17 @@ impl Agent {
             known_hashes: HashMap::new(),
             web,
             web_cache: None,
+            self_inspector: None,
+            experience_store: None,
+            task_journal: None,
+            audit_log: None,
             context,
             conversation: Vec::new(),
             task_transcript: Vec::new(),
             current_task_user: None,
+            current_task_id: None,
+            completed_actions: HashMap::new(),
+            resumed_from_checkpoint: false,
             app_approvals: AppApprovalStore::load(workspace.clone().join(".furina/approved_apps.json")),
             state: AgentState::Idle,
             repair_rounds: 0,
@@ -353,6 +384,18 @@ impl Agent {
             test_command: String::new(),
             scanned: false,
             pending_scan: None,
+            checkpoint_count: 0,
+            token_budget_limit: 0,
+            last_tool_signature: String::new(),
+            last_tool_result_digest: String::new(),
+            repeated_tool_calls: 0,
+            progress_revision: 0,
+            checkpoint_progress_revision: 0,
+            stalled_checkpoints: 0,
+            last_repair_reviewed: 0,
+            tool_patterns: HashSet::new(),
+            failure_evidence: Vec::new(),
+            stop_reason: None,
         }
     }
 
@@ -370,6 +413,18 @@ impl Agent {
         self.test_command.clear();
         self.scanned = false;
         self.pending_scan = None;
+        self.checkpoint_count = 0;
+        self.token_budget_limit = self.cfg.llm.max_total_tokens.max(1);
+        self.last_tool_signature.clear();
+        self.last_tool_result_digest.clear();
+        self.repeated_tool_calls = 0;
+        self.progress_revision = 0;
+        self.checkpoint_progress_revision = 0;
+        self.stalled_checkpoints = 0;
+        self.last_repair_reviewed = 0;
+        self.tool_patterns.clear();
+        self.failure_evidence.clear();
+        self.stop_reason = None;
     }
 
     /// 注入人格上下文提供者（Soul Engine 适配器）。
@@ -391,6 +446,26 @@ impl Agent {
         self.web_cache = Some(cache);
     }
 
+    pub fn set_self_inspector(&mut self, inspector: SelfInspector) {
+        self.self_inspector = Some(inspector);
+    }
+
+    pub fn set_experience_store(&mut self, store: AgentExperienceStore) {
+        self.experience_store = Some(store);
+    }
+
+    pub fn set_task_journal(&mut self, store: TaskJournalStore) {
+        self.task_journal = Some(store);
+    }
+
+    pub fn set_audit_log(&mut self, log: AuditLog) {
+        self.audit_log = Some(log);
+    }
+
+    pub fn recoverable_task(&self) -> Option<TaskRecoverySummary> {
+        self.task_journal.as_ref().and_then(TaskJournalStore::summary)
+    }
+
     /// 注入 Soul 私有目录（如 `<root>/persona`、`<root>/.furina`），
     /// 这些路径对 LLM 工具完全不可读/不可写（人格机制、记忆与密钥的边界）。
     pub fn set_private_paths(&mut self, paths: Vec<PathBuf>) {
@@ -406,17 +481,87 @@ impl Agent {
         self.app_approvals = AppApprovalStore::load(path);
     }
 
+    fn persist_task_snapshot(&self, status: &str, summary: &str) {
+        let Some(store) = &self.task_journal else { return };
+        let Some(task_id) = &self.current_task_id else { return };
+        let Some(goal) = &self.current_task_user else { return };
+        let mut completed_actions = self.completed_actions.values().cloned().collect::<Vec<_>>();
+        completed_actions.sort_by(|left, right| left.fingerprint.cmp(&right.fingerprint));
+        let record = TaskCheckpointRecord {
+            schema_version: TASK_JOURNAL_SCHEMA_VERSION,
+            task_id: task_id.clone(),
+            original_goal: sanitize_journal_text(goal, 4_000),
+            status: status.to_string(),
+            checkpoint_count: self.checkpoint_count,
+            steps: self.steps,
+            total_tokens: self.total_tokens,
+            repair_rounds: self.repair_rounds,
+            token_budget_limit: self.token_budget_limit,
+            summary: sanitize_journal_text(summary, 2_000),
+            blocking: sanitize_journal_text(self.failure_evidence.last().map(String::as_str).unwrap_or("无明确阻塞"), 500),
+            wrote_files: self.wrote_files,
+            verified: self.verified,
+            test_command: sanitize_journal_text(&self.test_command, 500),
+            scanned: self.scanned,
+            known_hashes: self.known_hashes.iter().map(|(path, hash)| (path.clone(), hash.clone())).collect::<BTreeMap<_, _>>(),
+            completed_actions,
+            failure_evidence: self.failure_evidence.iter().map(|item| sanitize_journal_text(item, 500)).collect(),
+            tool_patterns: self.tool_patterns.iter().cloned().collect(),
+            app_version: env!("CARGO_PKG_VERSION").into(),
+            updated_at_ms: now_ms(),
+        };
+        let _ = store.save(&record);
+    }
+
     fn begin_task(&mut self, task: &str) {
         self.clear_task_context();
+        self.current_task_id = Some(format!("task_{}", now_ms()));
         self.current_task_user = Some(task.to_string());
         self.task_transcript.push(ChatMessage::System { content: self.system_prompt.clone() });
         self.task_transcript.extend(self.conversation.iter().cloned());
         self.task_transcript.push(ChatMessage::User { content: format!("任务：{task}") });
+        self.persist_task_snapshot("active", "任务已开始，尚未执行工具");
+    }
+
+    fn restore_task(&mut self, record: TaskCheckpointRecord) {
+        self.clear_task_context();
+        self.current_task_id = Some(record.task_id);
+        self.current_task_user = Some(record.original_goal.clone());
+        self.task_transcript.push(ChatMessage::System { content: self.system_prompt.clone() });
+        self.task_transcript.extend(self.conversation.iter().cloned());
+        self.task_transcript.push(ChatMessage::User { content: format!("任务：{}", record.original_goal) });
+        self.task_transcript.push(ChatMessage::User { content: format!(
+            "[恢复检查点 #{}]
+{}
+当前阻塞：{}
+请先检查当前文件与运行状态，不要重复已经成功的写入、命令、提交或应用启动。",
+            record.checkpoint_count, record.summary, record.blocking,
+        ) });
+        self.known_hashes = record.known_hashes.into_iter().collect();
+        self.completed_actions = record.completed_actions.into_iter().map(|action| (action.fingerprint.clone(), action)).collect();
+        self.repair_rounds = record.repair_rounds;
+        self.steps = record.steps;
+        self.total_tokens = record.total_tokens;
+        self.wrote_files = record.wrote_files;
+        self.verified = record.verified;
+        self.test_command = record.test_command;
+        self.scanned = record.scanned;
+        self.checkpoint_count = record.checkpoint_count;
+        self.token_budget_limit = record.token_budget_limit.max(self.cfg.llm.max_total_tokens.max(1));
+        self.progress_revision = self.steps as u64;
+        self.checkpoint_progress_revision = self.progress_revision;
+        self.tool_patterns = record.tool_patterns.into_iter().collect();
+        self.failure_evidence = record.failure_evidence;
+        self.resumed_from_checkpoint = true;
+        self.persist_task_snapshot("active", "任务已从持久化检查点恢复");
     }
 
     fn clear_task_context(&mut self) {
         self.task_transcript.clear();
         self.current_task_user = None;
+        self.current_task_id = None;
+        self.completed_actions.clear();
+        self.resumed_from_checkpoint = false;
         self.known_hashes.clear();
         self.repair_rounds = 0;
         self.steps = 0;
@@ -427,6 +572,18 @@ impl Agent {
         self.test_command.clear();
         self.scanned = false;
         self.pending_scan = None;
+        self.checkpoint_count = 0;
+        self.token_budget_limit = self.cfg.llm.max_total_tokens.max(1);
+        self.last_tool_signature.clear();
+        self.last_tool_result_digest.clear();
+        self.repeated_tool_calls = 0;
+        self.progress_revision = 0;
+        self.checkpoint_progress_revision = 0;
+        self.stalled_checkpoints = 0;
+        self.last_repair_reviewed = 0;
+        self.tool_patterns.clear();
+        self.failure_evidence.clear();
+        self.stop_reason = None;
     }
 
     fn remember_conversation(&mut self, assistant: &str) {
@@ -443,6 +600,9 @@ impl Agent {
     }
 
     fn fail_task(&mut self, error: &str) {
+        self.stop_reason = Some("error".into());
+        self.persist_task_snapshot("interrupted", error);
+        self.record_experience(false, error, None);
         self.state = AgentState::Failed;
         self.emit_state();
         self.emit(Event::Done { success: false, summary: error.to_string() });
@@ -450,6 +610,49 @@ impl Agent {
     }
 
     pub async fn run_task(&mut self, task: &str) -> anyhow::Result<TaskOutcome> {
+        if is_resume_request(task) {
+            if let Some(record) = self.task_journal.as_ref().and_then(TaskJournalStore::load) {
+                let detail = format!(
+                    "检测到未完成任务：{}\n状态：{}，检查点 {}，已执行 {} 步。\n恢复时会阻止重复执行已成功的非幂等动作。\n\n是否恢复？",
+                    sanitize_journal_text(&record.original_goal, 300), record.status, record.checkpoint_count, record.steps,
+                );
+                self.current_task_id = Some(record.task_id.clone());
+                if self.ask_approval("恢复上次任务", &detail).await {
+                    let goal = record.original_goal.clone();
+                    self.restore_task(record);
+                    self.emit(Event::TaskRecoveryResumed {
+                        task_id: self.current_task_id.clone().unwrap_or_default(),
+                        checkpoint_count: self.checkpoint_count,
+                        steps: self.steps,
+                    });
+                    return match self.run_task_inner(&goal).await {
+                        Ok(outcome) => Ok(outcome),
+                        Err(error) => {
+                            self.fail_task(&error.to_string());
+                            Err(error)
+                        }
+                    };
+                }
+                if let Some(store) = &self.task_journal {
+                    let _ = store.clear();
+                }
+                self.emit(Event::TaskRecoveryDiscarded { task_id: record.task_id });
+                self.clear_task_context();
+                let summary = "已放弃上次未完成任务".to_string();
+                self.state = AgentState::Done;
+                self.emit_state();
+                self.emit(Event::Done { success: false, summary: summary.clone() });
+                return Ok(TaskOutcome {
+                    success: false,
+                    summary,
+                    steps: 0,
+                    repair_rounds: 0,
+                    total_tokens: 0,
+                    checkpoint_count: 0,
+                    stop_reason: Some("recovery_declined".into()),
+                });
+            }
+        }
         self.begin_task(task);
         match self.run_task_inner(task).await {
             Ok(outcome) => Ok(outcome),
@@ -500,35 +703,53 @@ impl Agent {
         let mut final_text = String::new();
 
         loop {
-            if self.steps >= self.cfg.agent.max_steps_per_task {
-                return self.finish(false, format!("超过最大步骤数（{}）", self.cfg.agent.max_steps_per_task)).await;
-            }
-            if self.total_tokens >= self.cfg.llm.max_total_tokens {
-                return self.finish(false, format!("超过 token 预算（{}）", self.cfg.llm.max_total_tokens)).await;
+            if self.total_tokens >= self.token_budget_limit {
+                if !self.checkpoint("token_budget", true).await? {
+                    return self.finish_with_reason(
+                        false,
+                        "用户选择在 token 预算检查点停止任务".into(),
+                        Some("budget_declined".into()),
+                    ).await;
+                }
+                self.token_budget_limit = self
+                    .token_budget_limit
+                    .saturating_add(self.cfg.llm.max_total_tokens.max(1));
+                self.task_transcript.push(ChatMessage::User {
+                    content: format!("[预算已扩展] 新的累计 token 预算为 {}，请继续任务。", self.token_budget_limit),
+                });
             }
 
             let current_context = self
                 .prompt_context
                 .as_ref()
-                .map(|p| p.context_block_for(interaction_mode.as_str()))
-                .filter(|s| !s.is_empty())
+                .map(|provider| provider.context_block_for(interaction_mode.as_str()))
+                .filter(|context| !context.is_empty())
                 .unwrap_or_default();
+            let experience_context = if self.cfg.agent.experience_learning_enabled {
+                self.experience_store
+                    .as_ref()
+                    .map(|store| store.context_for(task, 3, 2_000))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let combined_context = [current_context, experience_context]
+                .into_iter()
+                .filter(|context| !context.is_empty())
+                .collect::<Vec<_>>()
+                .join("
+
+");
             let mut messages = self.context.fit(&self.task_transcript);
-            append_current_context(&mut messages, &current_context);
-            // 流式 LLM：增量文本实时发射 MessageDelta（UI 打字机 + 逐句语音），
-            // 完整内容仍在返回后写入转录（上下文/记忆/日志语义不变）。
+            append_current_context(&mut messages, &combined_context);
             let events = self.events.clone();
             let resp = {
                 let mut on_delta = |chunk: &str| {
                     if !chunk.is_empty() {
-                        events.emit(Event::MessageDelta {
-                            content: chunk.to_string(),
-                        });
+                        events.emit(Event::MessageDelta { content: chunk.to_string() });
                     }
                 };
-                self.llm
-                    .complete_stream(&messages, &tools, &mut on_delta)
-                    .await?
+                self.llm.complete_stream(&messages, &tools, &mut on_delta).await?
             };
             self.total_tokens = self.total_tokens.saturating_add(resp.prompt_tokens + resp.completion_tokens);
             self.emit(Event::Tokens {
@@ -548,37 +769,234 @@ impl Agent {
             }
 
             if !has_tools {
-                // 最终消息：若修改过文件且从未验证通过，自动运行一次测试。
                 if self.wrote_files && !self.verified && !self.test_command.is_empty() {
-                    let test_cmd = self.test_command.clone();
-                    self.run_verification(&test_cmd).await?;
-                    if self.repair_rounds > self.cfg.agent.max_repair_rounds {
-                        return self
-                            .finish(false, format!("修复轮数超过上限（{}）", self.cfg.agent.max_repair_rounds))
-                            .await;
+                    let test_command = self.test_command.clone();
+                    self.run_verification(&test_command).await?;
+                    if self.repair_review_due() && !self.checkpoint("repair_review", false).await? {
+                        return self.finish_with_reason(
+                            false,
+                            "连续验证失败后用户选择停止任务".into(),
+                            Some("repair_review_declined".into()),
+                        ).await;
                     }
                     if !self.verified {
-                        continue; // 让 LLM 根据验证结果继续修复
+                        continue;
                     }
                 }
                 return self.finish(true, final_text).await;
             }
 
-            // 惰性扫描：任务真正需要调用工具时才扫描项目。
-            // 纯聊天回合不会走到这里，因此对话保持纯文本。
             if !self.scanned {
                 self.scan_project().await?;
             }
 
             for call in &resp.tool_calls {
-                self.steps += 1;
-                if self.steps >= self.cfg.agent.max_steps_per_task {
-                    return self.finish(false, format!("超过最大步骤数（{}）", self.cfg.agent.max_steps_per_task)).await;
-                }
+                self.steps = self.steps.saturating_add(1);
                 self.handle_tool_call(call).await?;
+
+                let repeated_limit = self.cfg.agent.max_repeated_tool_calls.max(2);
+                if self.repeated_tool_calls >= repeated_limit {
+                    self.task_transcript.push(ChatMessage::User {
+                        content: "[停滞检测] 相同工具调用及结果已重复出现。不要再次执行同一动作，请重新分析假设并选择不同路径。".into(),
+                    });
+                    if !self.checkpoint("repeated_tool_call", false).await? {
+                        return self.finish_with_reason(
+                            false,
+                            "检测到重复工具死循环，用户选择停止任务".into(),
+                            Some("stalled".into()),
+                        ).await;
+                    }
+                    self.repeated_tool_calls = 0;
+                } else {
+                    let interval = self.cfg.agent.checkpoint_interval_steps.max(1);
+                    if self.steps % interval == 0 && !self.checkpoint("step_interval", false).await? {
+                        return self.finish_with_reason(
+                            false,
+                            "长任务停滞检查点被用户终止".into(),
+                            Some("stalled".into()),
+                        ).await;
+                    }
+                }
+
+                if self.repair_review_due() && !self.checkpoint("repair_review", false).await? {
+                    return self.finish_with_reason(
+                        false,
+                        "连续验证失败后用户选择停止任务".into(),
+                        Some("repair_review_declined".into()),
+                    ).await;
+                }
             }
-            if self.repair_rounds > self.cfg.agent.max_repair_rounds {
-                return self.finish(false, format!("修复轮数超过上限（{}）", self.cfg.agent.max_repair_rounds)).await;
+        }
+    }
+
+    fn repair_review_due(&mut self) -> bool {
+        let interval = self.cfg.agent.repair_review_after.max(1);
+        if self.repair_rounds >= self.last_repair_reviewed.saturating_add(interval) {
+            self.last_repair_reviewed = self.repair_rounds;
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn checkpoint(&mut self, reason: &str, force_review: bool) -> anyhow::Result<bool> {
+        self.checkpoint_count = self.checkpoint_count.saturating_add(1);
+        let progressed = self.progress_revision > self.checkpoint_progress_revision;
+        if progressed {
+            self.stalled_checkpoints = 0;
+        } else {
+            self.stalled_checkpoints = self.stalled_checkpoints.saturating_add(1);
+        }
+        self.checkpoint_progress_revision = self.progress_revision;
+        let goal = self.current_task_user.as_deref().unwrap_or("当前任务");
+        let blocking = self.failure_evidence.last().cloned().unwrap_or_else(|| "无明确阻塞".into());
+        let summary = format!(
+            "原始目标：{}
+已完成：执行 {} 次工具调用，累计 {} tokens，修复 {} 轮
+待处理：继续完成原始目标并验证结果
+当前阻塞：{}
+文件变化：{}
+验证状态：{}
+下一步：基于最新证据重新规划，避免重复无效动作",
+            truncate_text(goal, 500),
+            self.steps,
+            self.total_tokens,
+            self.repair_rounds,
+            truncate_text(&blocking, 500),
+            if self.wrote_files { "已产生变更" } else { "尚未修改文件" },
+            if self.verified { "已通过" } else { "尚未通过" },
+        );
+        self.emit(Event::Checkpoint {
+            sequence: self.checkpoint_count,
+            steps: self.steps,
+            tokens: self.total_tokens,
+            reason: reason.to_string(),
+            summary: summary.clone(),
+        });
+        let compact = self.context.fit(&self.task_transcript);
+        self.task_transcript = compact;
+        trim_incomplete_turn(&mut self.task_transcript);
+        self.task_transcript.push(ChatMessage::User {
+            content: format!("[任务检查点 #{} · {}]
+{}", self.checkpoint_count, reason, summary),
+        });
+        self.persist_task_snapshot("checkpoint", &summary);
+
+        let stalled_limit = self.cfg.agent.max_stalled_checkpoints.max(1);
+        if force_review || self.stalled_checkpoints >= stalled_limit {
+            let detail = format!(
+                "任务已运行 {} 步、使用 {} tokens。
+{}
+
+是否允许芙芙重新规划并继续？",
+                self.steps, self.total_tokens, summary,
+            );
+            if !self.ask_approval("继续长任务", &detail).await {
+                self.persist_task_snapshot("paused", &summary);
+                self.stop_reason = Some(if force_review { reason.into() } else { "stalled".into() });
+                return Ok(false);
+            }
+            self.stalled_checkpoints = 0;
+            self.task_transcript.push(ChatMessage::User {
+                content: "[用户已批准继续] 请基于检查点重新规划，优先选择能产生新证据的动作。".into(),
+            });
+        }
+        Ok(true)
+    }
+
+    fn observe_tool_result(&mut self, name: &str, arguments: &str, ok: bool, summary: &str) {
+        self.tool_patterns.insert(name.to_string());
+        let signature = format!("{}:{}", name, normalize_tool_arguments(arguments));
+        let digest = stable_digest(summary);
+        if signature == self.last_tool_signature && digest == self.last_tool_result_digest {
+            self.repeated_tool_calls = self.repeated_tool_calls.saturating_add(1);
+        } else {
+            self.repeated_tool_calls = 1;
+            self.progress_revision = self.progress_revision.saturating_add(1);
+            self.last_tool_signature = signature;
+            self.last_tool_result_digest = digest;
+        }
+        if !ok {
+            self.failure_evidence.push(format!("{}: {}", name, truncate_text(summary, 500)));
+            if self.failure_evidence.len() > 20 {
+                self.failure_evidence.remove(0);
+            }
+        }
+    }
+
+    async fn reflect_on_task(&mut self, success: bool, summary: &str) -> Option<String> {
+        let significant = !success || self.repair_rounds > 0 || self.checkpoint_count > 0;
+        if !significant { return None; }
+        let task = redact_reflection_text(self.current_task_user.as_deref().unwrap_or(""), 500);
+        let summary = redact_reflection_text(summary, 500);
+        let failures = self.failure_evidence.iter().take(8)
+            .map(|evidence| redact_reflection_text(evidence, 300)).collect::<Vec<_>>().join("\n- ");
+        let tools = self.tool_patterns.iter().cloned().collect::<Vec<_>>().join(", ");
+        let messages = vec![
+            ChatMessage::System { content: "你是 Agent 任务复盘器。只输出 JSON，不调用工具。格式：{\"lesson\":\"可复用且具体的经验\"}。不得包含密钥、完整源码或原始长输出。".into() },
+            ChatMessage::User { content: format!(
+                "任务：{}\n结果：{}\n摘要：{}\n工具：{}\n修复轮数：{}\n检查点：{}\n失败证据：\n- {}",
+                task, if success { "成功" } else { "失败" }, summary, tools,
+                self.repair_rounds, self.checkpoint_count, failures,
+            ) },
+        ];
+        let response = self.llm.complete(&messages, &[]).await.ok()?;
+        self.total_tokens = self.total_tokens.saturating_add(response.prompt_tokens + response.completion_tokens);
+        self.emit(Event::Tokens {
+            prompt: response.prompt_tokens,
+            completion: response.completion_tokens,
+            total: self.total_tokens,
+        });
+        let content = response.content?;
+        let start = content.find('{')?;
+        let end = content.rfind('}')?;
+        let value: Value = serde_json::from_str(&content[start..=end]).ok()?;
+        value.get("lesson").and_then(Value::as_str)
+            .map(|lesson| redact_reflection_text(lesson, 800))
+            .filter(|lesson| !lesson.trim().is_empty())
+    }
+
+    fn record_experience(&mut self, success: bool, summary: &str, lesson_override: Option<String>) {
+        if !self.cfg.agent.experience_learning_enabled || self.steps == 0 {
+            return;
+        }
+        let trace = TaskTrace {
+            task: self.current_task_user.clone().unwrap_or_default(),
+            success,
+            summary: truncate_text(summary, 500),
+            tool_patterns: self.tool_patterns.iter().cloned().collect(),
+            failure_evidence: self.failure_evidence.clone(),
+            repair_rounds: self.repair_rounds,
+            checkpoint_count: self.checkpoint_count,
+            lesson_override,
+        };
+        let recorded = self.experience_store.as_mut().and_then(|store| {
+            store.record(trace).ok().map(|record| {
+                let candidate = store.proposal_candidate(&record);
+                (record, candidate)
+            })
+        });
+        let Some((record, candidate)) = recorded else { return };
+        self.emit(Event::ExperienceLearned { id: record.id.clone(), summary: record.lesson.clone() });
+        if candidate && self.cfg.agent.self_change_proposals_enabled {
+            if let Some(inspector) = self.self_inspector.clone() {
+                let input = SelfChangeInput {
+                    problem: format!("重复出现的 Agent 失败模式：{}", record.lesson),
+                    evidence: record.failure_evidence.clone(),
+                    changes: Vec::new(),
+                    config_updates: std::collections::BTreeMap::new(),
+                    tests: Vec::new(),
+                    risk: "这是证据触发的诊断提案，尚未包含可应用源码变更。".into(),
+                    rollback: "未修改任何自身文件。".into(),
+                };
+                if let Ok(proposal) = inspector.create_proposal(input) {
+                    self.emit(Event::SelfChangeProposed {
+                        id: proposal.id,
+                        summary: proposal.problem,
+                        targets: Vec::new(),
+                        applicable: false,
+                    });
+                }
             }
         }
     }
@@ -608,13 +1026,91 @@ impl Agent {
 
     async fn handle_tool_call(&mut self, call: &ToolCall) -> anyhow::Result<()> {
         let name = call.function.name.clone();
-        let args: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
+        let raw_arguments = call.function.arguments.clone();
+        let args: Value = serde_json::from_str(&raw_arguments).unwrap_or(Value::Null);
         let scan_prefix = self.pending_scan.take().unwrap_or_default();
         self.emit(Event::ToolCall { name: name.clone(), summary: args.to_string() });
         self.state = AgentState::Executing;
         self.emit_state();
 
-        let result: Result<Value, String> = match name.as_str() {
+        let action_fingerprint = action_fingerprint(&name, &raw_arguments);
+        let replayed_action = if self.resumed_from_checkpoint && is_non_idempotent_tool(&name) {
+            self.completed_actions.get(&action_fingerprint).cloned()
+        } else {
+            None
+        };
+        let result: Result<Value, String> = if let Some(action) = replayed_action {
+            Ok(json!({
+                "already_completed": true,
+                "tool": action.tool,
+                "message": format!("恢复任务时跳过已成功执行的动作；请检查当前状态后决定下一步。摘要：{}", action.summary),
+            }))
+        } else {
+            match name.as_str() {
+            "self_status" => self
+                .self_inspector
+                .as_ref()
+                .ok_or_else(|| "自身检查未配置".to_string())
+                .map(SelfInspector::status),
+            "self_read_source" => {
+                let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+                let max_bytes = args.get("max_bytes").and_then(Value::as_u64).unwrap_or(60_000) as usize;
+                self.self_inspector
+                    .as_ref()
+                    .ok_or_else(|| "自身检查未配置".to_string())
+                    .and_then(|inspector| inspector.read_source(path, max_bytes).map_err(|error| error.to_string()))
+            }
+            "self_search_source" => {
+                let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+                let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
+                let regex = args.get("regex").and_then(Value::as_bool).unwrap_or(false);
+                let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
+                self.self_inspector
+                    .as_ref()
+                    .ok_or_else(|| "自身检查未配置".to_string())
+                    .and_then(|inspector| inspector.search_source(path, pattern, regex, limit).map_err(|error| error.to_string()))
+            }
+            "self_propose_change" => {
+                async {
+                    let inspector = self.self_inspector.clone().ok_or_else(|| "自身改进提案未配置".to_string())?;
+                    let input: SelfChangeInput = serde_json::from_value(args).map_err(|error| error.to_string())?;
+                    let mut proposal = inspector.create_proposal(input).map_err(|error| error.to_string())?;
+                    let targets = proposal.changes.iter().map(|change| change.path.clone()).collect::<Vec<_>>();
+                    self.emit(Event::SelfChangeProposed {
+                        id: proposal.id.clone(),
+                        summary: proposal.problem.clone(),
+                        targets,
+                        applicable: proposal.applicable,
+                    });
+                    if !proposal.applicable {
+                        Ok(json!({"proposal_id": proposal.id, "exported": true, "applicable": false}))
+                    } else {
+                        for command in &proposal.tests {
+                            if let Verdict::Block(reason) = self.gateway.check(&ActionKind::RunCommand { command: command.clone() }) {
+                                inspector.mark_proposal_status(&mut proposal, "blocked").map_err(|error| error.to_string())?;
+                                return Err(reason);
+                            }
+                        }
+                        let detail = inspector.proposal_approval_detail(&proposal);
+                        if !self.ask_approval("应用自身改进提案", &detail).await {
+                            inspector.mark_proposal_status(&mut proposal, "rejected").map_err(|error| error.to_string())?;
+                            Ok(json!({"proposal_id": proposal.id, "denied": true, "message": "用户拒绝应用自身改进提案"}))
+                        } else {
+                            match inspector.apply_proposal(&mut proposal).await {
+                                Ok(summary) => {
+                                    self.emit(Event::SelfChangeApplied { id: proposal.id.clone(), success: true, summary: summary.clone() });
+                                    Ok(json!({"proposal_id": proposal.id, "applied": true, "summary": summary}))
+                                }
+                                Err(error) => {
+                                    let summary = error.to_string();
+                                    self.emit(Event::SelfChangeApplied { id: proposal.id.clone(), success: false, summary: summary.clone() });
+                                    Err(summary)
+                                }
+                            }
+                        }
+                    }
+                }.await
+            }
             "fs_read_file" | "fs_search" | "fs_diff" => {
                 let path = args.get("path").and_then(Value::as_str).unwrap_or("").to_string();
                 let private = is_private_path(&self.private_paths, &self.workspace, &path);
@@ -783,6 +1279,7 @@ impl Agent {
                 }
             }
             _ => Err(format!("未知工具: {name}")),
+            }
         };
 
         match result {
@@ -791,21 +1288,35 @@ impl Agent {
                 let blocked = v.get("blocked").is_some();
                 let ok = !denied && !blocked;
                 let summary = summarize_value(&v);
+                let already_completed = v.get("already_completed").is_some();
                 self.emit(Event::ToolResult { name: name.clone(), ok, summary: summary.clone() });
-                if (name == "fs_write_file" || name == "fs_create_file") && ok {
+                self.observe_tool_result(&name, &raw_arguments, ok, &summary);
+                if (name == "fs_write_file" || name == "fs_create_file") && ok && !already_completed {
                     self.wrote_files = true;
+                }
+                if ok && !already_completed && is_non_idempotent_tool(&name) {
+                    self.completed_actions.insert(action_fingerprint.clone(), CompletedAction {
+                        fingerprint: action_fingerprint.clone(),
+                        tool: name.clone(),
+                        result_fingerprint: stable_digest(&summary),
+                        summary: sanitize_journal_text(&summary, 500),
+                        completed_at_ms: now_ms(),
+                    });
                 }
                 self.task_transcript.push(ChatMessage::Tool {
                     tool_call_id: call.id.clone(),
                     content: format!("{scan_prefix}{}", truncate_text(&summary, self.cfg.llm.tool_output_truncate)),
                 });
+                self.persist_task_snapshot("active", &summary);
             }
             Err(e) => {
                 self.emit(Event::ToolResult { name: name.clone(), ok: false, summary: e.clone() });
+                self.observe_tool_result(&name, &raw_arguments, false, &e);
                 self.task_transcript.push(ChatMessage::Tool {
                     tool_call_id: call.id.clone(),
                     content: format!("{scan_prefix}{}", truncate_text(&e, self.cfg.llm.tool_output_truncate)),
                 });
+                self.persist_task_snapshot("active", &e);
             }
         }
         Ok(())
@@ -887,9 +1398,11 @@ impl Agent {
             let detail = truncate_text(&format!("命令: {command}\n退出码: {exit}\n{stdout}{stderr}"), 6_000);
             if exit == 0 {
                 self.verified = true;
+                self.progress_revision = self.progress_revision.saturating_add(1);
                 self.emit(Event::Verify { passed: true, detail });
             } else {
                 self.repair_rounds += 1;
+                self.failure_evidence.push(format!("验证失败: {}", truncate_text(&detail, 500)));
                 self.state = AgentState::Repairing;
                 self.emit(Event::Verify { passed: false, detail });
             }
@@ -908,9 +1421,11 @@ impl Agent {
         let detail = truncate_text(&format!("命令: {command}\n退出码: {exit}\n{stdout}{stderr}"), 6_000);
         if exit == 0 {
             self.verified = true;
+            self.progress_revision = self.progress_revision.saturating_add(1);
             self.emit(Event::Verify { passed: true, detail: detail.clone() });
         } else {
             self.repair_rounds += 1;
+            self.failure_evidence.push(format!("自动验证失败: {}", truncate_text(&detail, 500)));
             self.state = AgentState::Repairing;
             self.emit(Event::Verify { passed: false, detail: detail.clone() });
         }
@@ -953,6 +1468,7 @@ impl Agent {
 
     async fn ask_approval(&mut self, kind: &str, detail: &str) -> bool {
         self.state = AgentState::AwaitingApproval;
+        self.persist_task_snapshot("awaiting_approval", kind);
         self.emit_state();
         self.emit(Event::ApprovalRequired { kind: kind.to_string(), detail: detail.to_string() });
         let ok = self
@@ -966,6 +1482,7 @@ impl Agent {
             self.emit(Event::ApprovalDenied { kind: kind.to_string() });
         }
         self.state = AgentState::Executing;
+        self.persist_task_snapshot("active", if ok { "审批已通过" } else { "审批被拒绝" });
         ok
     }
 
@@ -984,7 +1501,7 @@ impl Agent {
     }
 
     fn llm_tools(&self) -> Vec<ToolSpec> {
-        vec![
+        let mut tools = vec![
             ToolSpec {
                 name: "fs_read_file".into(),
                 description: "读取文本文件（工作区内直接读取；工作区外路径需用户审批）".into(),
@@ -1045,12 +1562,54 @@ impl Agent {
                 description: "打开网页并返回正文文本（需用户审批）".into(),
                 parameters: json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}),
             },
-        ]
+        ];
+        if self.cfg.agent.self_inspection_enabled && self.self_inspector.is_some() {
+            tools.extend([
+                ToolSpec {
+                    name: "self_status".into(),
+                    description: "检查 Furina 自身版本、运行模式、工具能力和脱敏配置；不会返回密钥、人格或记忆正文".into(),
+                    parameters: json!({"type":"object"}),
+                },
+                ToolSpec {
+                    name: "self_read_source".into(),
+                    description: "开发模式下只读检查白名单内的 Furina 自身源码；安装模式不可用".into(),
+                    parameters: json!({"type":"object","properties":{"path":{"type":"string"},"max_bytes":{"type":"integer"}},"required":["path"]}),
+                },
+                ToolSpec {
+                    name: "self_search_source".into(),
+                    description: "开发模式下在 Furina 自身源码白名单中搜索文本或正则；安装模式不可用".into(),
+                    parameters: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"regex":{"type":"boolean"},"limit":{"type":"integer"}},"required":["pattern"]}),
+                },
+            ]);
+            if self.cfg.agent.self_change_proposals_enabled {
+                tools.push(ToolSpec {
+                    name: "self_propose_change".into(),
+                    description: "创建自身源码改进提案。只能提交完整新文件内容；开发模式需用户审批并验证后应用，安装模式仅导出。禁止修改 Persona、Soul、密钥或记忆".into(),
+                    parameters: json!({
+                        "type":"object",
+                        "properties":{
+                            "problem":{"type":"string"},
+                            "evidence":{"type":"array","items":{"type":"string"}},
+                            "changes":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"expected_sha256":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}},
+                            "config_updates":{"type":"object","additionalProperties":true},
+                            "tests":{"type":"array","items":{"type":"string"}},
+                            "risk":{"type":"string"},
+                            "rollback":{"type":"string"}
+                        },
+                        "required":["problem","changes"]
+                    }),
+                });
+            }
+        }
+        tools
     }
 
     fn emit(&self, event: Event) {
         if let Some(p) = &self.prompt_context {
             p.observe_event(&event);
+        }
+        if let Some(log) = &self.audit_log {
+            let _ = log.record_event(self.current_task_id.as_deref(), &event);
         }
         self.events.emit(event);
     }
@@ -1060,6 +1619,22 @@ impl Agent {
     }
 
     async fn finish(&mut self, success: bool, summary: String) -> anyhow::Result<TaskOutcome> {
+        self.finish_with_reason(success, summary, None).await
+    }
+
+    async fn finish_with_reason(
+        &mut self,
+        success: bool,
+        summary: String,
+        stop_reason: Option<String>,
+    ) -> anyhow::Result<TaskOutcome> {
+        self.stop_reason = stop_reason.clone();
+        let resumable = matches!(stop_reason.as_deref(), Some("budget_declined" | "stalled" | "repair_review_declined"));
+        if resumable {
+            self.persist_task_snapshot("paused", &summary);
+        }
+        let lesson = self.reflect_on_task(success, &summary).await;
+        self.record_experience(success, &summary, lesson);
         self.state = if success { AgentState::Done } else { AgentState::Failed };
         self.emit_state();
         self.emit(Event::Done { success, summary: summary.clone() });
@@ -1069,13 +1644,62 @@ impl Agent {
             steps: self.steps,
             repair_rounds: self.repair_rounds,
             total_tokens: self.total_tokens,
+            checkpoint_count: self.checkpoint_count,
+            stop_reason,
         };
         if success {
             self.remember_conversation(&summary);
         }
+        if !resumable {
+            if let Some(store) = &self.task_journal {
+                let _ = store.clear();
+            }
+        }
         self.clear_task_context();
         Ok(outcome)
     }
+}
+
+fn redact_reflection_text(text: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for line in text.lines() {
+        let lower = line.to_lowercase();
+        if ["api_key", "apikey", "secret", "password", "token="].iter().any(|needle| lower.contains(needle)) {
+            output.push_str("[REDACTED]\n");
+        } else {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    truncate_text(output.trim(), max_chars)
+}
+
+fn normalize_tool_arguments(arguments: &str) -> String {
+    serde_json::from_str::<Value>(arguments)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| arguments.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn stable_digest(value: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn action_fingerprint(name: &str, arguments: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    hasher.update(b":");
+    hasher.update(normalize_tool_arguments(arguments).as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn is_non_idempotent_tool(name: &str) -> bool {
+    matches!(name, "fs_write_file" | "fs_create_file" | "term_run" | "git_commit" | "app_open" | "self_propose_change")
+}
+
+fn is_resume_request(task: &str) -> bool {
+    matches!(task.trim().to_lowercase().as_str(), "继续" | "恢复" | "继续上次任务" | "恢复上次任务" | "resume" | "continue")
 }
 
 fn with_escape_flag(mut v: Value, escape: bool) -> Value {

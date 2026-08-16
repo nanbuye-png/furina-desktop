@@ -33,6 +33,7 @@
     "resources": {
       "../../persona": "persona",
       "../resources/defaults/config.yaml": "defaults/config.yaml",
+      "../resources/self-manifest.json": "self-manifest.json",
       "bin": "bin"
     },
     "windows": {

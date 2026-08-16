@@ -1,0 +1,18 @@
+{
+  "version": "0.1.4",
+  "commit": null,
+  "config_schema_version": 2,
+  "components": [
+    "furina-core",
+    "furina-proto",
+    "furina-soul",
+    "furina-desktop",
+    "furina-sidecar"
+  ],
+  "self_tools": [
+    "self_status",
+    "self_read_source",
+    "self_search_source",
+    "self_propose_change"
+  ]
+}

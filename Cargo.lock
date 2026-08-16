@@ -875,10 +875,12 @@ dependencies = [
  "furina-proto",
  "furina-soul",
  "futures-util",
+ "regex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "tokio",
  "winreg 0.52.0",
 ]

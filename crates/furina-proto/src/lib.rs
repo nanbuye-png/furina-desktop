@@ -110,6 +110,32 @@ pub enum Event {
         failed: i64,
         summary: String,
     },
+    Checkpoint {
+        sequence: u32,
+        steps: u32,
+        tokens: u64,
+        reason: String,
+        summary: String,
+    },
+    ExperienceLearned { id: String, summary: String },
+    SelfChangeProposed {
+        id: String,
+        summary: String,
+        targets: Vec<String>,
+        applicable: bool,
+    },
+    SelfChangeApplied { id: String, success: bool, summary: String },
+    TaskRecoveryAvailable {
+        task_id: String,
+        goal: String,
+        status: String,
+        checkpoint_count: u32,
+        steps: u32,
+        updated_at_ms: u128,
+    },
+    TaskRecoveryResumed { task_id: String, checkpoint_count: u32, steps: u32 },
+    TaskRecoveryDiscarded { task_id: String },
+    DiagnosticExported { path: String },
     Done { success: bool, summary: String },
     Log { level: String, message: String },
 }
@@ -140,6 +166,8 @@ pub struct TaskOutcome {
     pub steps: u32,
     pub repair_rounds: u32,
     pub total_tokens: u64,
+    pub checkpoint_count: u32,
+    pub stop_reason: Option<String>,
 }
 
 #[cfg(test)]

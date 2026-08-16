@@ -15,6 +15,14 @@ llm:
       model: deepseek-chat
       vision: false
 persona: furina
+agent:
+  checkpoint_interval_steps: 32
+  max_repeated_tool_calls: 3
+  max_stalled_checkpoints: 2
+  repair_review_after: 3
+  self_inspection_enabled: true
+  experience_learning_enabled: true
+  self_change_proposals_enabled: true
 approval:
   mode: confirm
   auto_approve_read_only_web: true
