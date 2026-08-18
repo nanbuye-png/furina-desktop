@@ -866,7 +866,7 @@ dependencies = [
 
 [[package]]
 name = "furina-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -887,7 +887,7 @@ dependencies = [
 
 [[package]]
 name = "furina-desktop"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -905,7 +905,7 @@ dependencies = [
 
 [[package]]
 name = "furina-proto"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -913,7 +913,7 @@ dependencies = [
 
 [[package]]
 name = "furina-soul"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "furina-proto",

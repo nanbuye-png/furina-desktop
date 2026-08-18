@@ -12,6 +12,7 @@
 use crate::config::Config;
 use crate::proxy::apply_system_proxy;
 use base64::Engine as _;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -198,7 +199,6 @@ impl VoiceClient {
         }
         format!("[{t}]")
     }
-
     /// 合成语音并写入输出目录，返回音频文件路径。
     /// `speed`：朗读语速（0.5–2.0，1.0 为正常）。
     pub async fn synthesize(&self, text: &str, emotion: &str, speed: f64) -> anyhow::Result<PathBuf> {
@@ -491,11 +491,12 @@ fn env_key(var: &str, fallback: &str) -> anyhow::Result<String> {
     Ok(key)
 }
 
-/// 把回复文本整理成适合朗读的形式：跳过代码块、去掉 markdown 行首符号、
-/// 合并多余空行、按配置上限截断。
+/// 把回复文本整理成适合朗读的形式：跳过代码块、去掉 markdown、旁白和表情、
+/// 合并多余空白、按配置上限截断。
 fn clean_for_tts(text: &str, max_len: usize) -> String {
     let mut out = String::new();
     let mut in_fence = false;
+    let link_re = Regex::new(r"\[([^\]\n]+)\]\((?:[^()\n]|\([^()\n]*\))*\)").expect("valid markdown link regex");
     for raw in text.lines() {
         let line = raw.trim();
         if line.starts_with("```") {
@@ -505,21 +506,139 @@ fn clean_for_tts(text: &str, max_len: usize) -> String {
         if in_fence || line.is_empty() {
             continue;
         }
+        let line = link_re.replace_all(line, "$1");
         let line = line
-            .trim_start_matches(['#', '*', '-', '>', '|'])
+            .trim_start_matches(['#', '-', '>', '|'])
             .trim();
+        let line = line.strip_prefix("* ").unwrap_or(line).trim();
         if line.is_empty() {
             continue;
         }
         if !out.is_empty() {
             out.push('\n');
         }
-        out.push_str(line);
+        out.push_str(&line);
     }
-    let out: String = out.chars().take(max_len).collect();
-    out.trim().to_string()
+    let filtered = strip_tts_asides(&out);
+    let filtered = strip_tts_emphasis_and_emoji(&filtered);
+    filtered.chars().take(max_len).collect::<String>().trim().to_string()
 }
 
+fn bracket_pair(opening: char) -> Option<char> {
+    match opening {
+        '（' => Some('）'),
+        '(' => Some(')'),
+        '【' => Some('】'),
+        '[' => Some(']'),
+        '「' => Some('」'),
+        '『' => Some('』'),
+        _ => None,
+    }
+}
+
+fn find_matching_bracket(chars: &[char], start: usize) -> Option<usize> {
+    let mut stack = vec![chars[start]];
+    for (position, character) in chars.iter().enumerate().skip(start + 1) {
+        if bracket_pair(*character).is_some() {
+            stack.push(*character);
+            continue;
+        }
+        let closes = matches!(
+            (*character, stack.last().copied()),
+            ('）', Some('（'))
+                | (')', Some('('))
+                | ('】', Some('【'))
+                | (']', Some('['))
+                | ('」', Some('「'))
+                | ('』', Some('『'))
+        );
+        if closes {
+            stack.pop();
+            if stack.is_empty() {
+                return Some(position);
+            }
+        }
+    }
+    None
+}
+
+fn is_tts_emoji(character: char) -> bool {
+    let code = character as u32;
+    matches!(
+        code,
+        0x1F000..=0x1FAFF
+            | 0x2300..=0x23FF
+            | 0x2600..=0x27BF
+            | 0xFE0E..=0xFE0F
+            | 0x200D
+    )
+}
+
+fn is_tts_aside_content(content: &str) -> bool {
+    let normalized: String = content
+        .chars()
+        .filter(|character| !is_tts_emoji(*character) && !character.is_whitespace())
+        .filter(|character| !character.is_ascii_punctuation())
+        .collect();
+    if normalized.is_empty() {
+        return true;
+    }
+    let lowered = content.trim().to_lowercase();
+    if ["动作", "旁白", "内心", "心想", "心理活动", "画外音", "os"]
+        .iter()
+        .any(|prefix| lowered.starts_with(prefix))
+    {
+        return true;
+    }
+    let cues = [
+        "微笑", "轻笑", "笑了", "笑着", "叹气", "点头", "摇头", "眨眼", "挑眉",
+        "挥手", "看向", "靠近", "转身", "沉默", "停顿", "愣住", "脸红", "耳朵发红",
+        "紧张", "困惑", "疑惑", "惊讶", "吸气", "呼气", "哭声", "笑声", "脚步声",
+        "风声", "音乐声",
+    ];
+    cues.iter().any(|cue| content.contains(cue)) && content.chars().count() <= 40
+}
+
+fn strip_tts_asides(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut output = String::new();
+    let mut position = 0;
+    while position < chars.len() {
+        if bracket_pair(chars[position]).is_some() {
+            if let Some(closing) = find_matching_bracket(&chars, position) {
+                let content: String = chars[position + 1..closing].iter().collect();
+                if !is_tts_aside_content(&content) {
+                    output.extend(content.chars());
+                }
+                position = closing + 1;
+                continue;
+            }
+        }
+        output.push(chars[position]);
+        position += 1;
+    }
+    output
+}
+
+fn strip_tts_emphasis_and_emoji(text: &str) -> String {
+    let emphasis_re = Regex::new(r"\*([^*\n]{1,80})\*").expect("valid emphasis regex");
+    let without_emphasis = emphasis_re.replace_all(text, |captures: &regex::Captures<'_>| {
+        let content = captures.get(1).map(|match_| match_.as_str()).unwrap_or_default();
+        if is_tts_aside_content(content) {
+            String::new()
+        } else {
+            content.to_string()
+        }
+    });
+    let filtered: String = without_emphasis
+        .chars()
+        .filter(|character| !is_tts_emoji(*character))
+        .collect();
+    filtered
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 fn short(text: &str) -> String {
     let t: String = text.chars().take(300).collect();
     if text.chars().count() > 300 {
@@ -700,6 +819,14 @@ mod tests {
         assert!(cleaned.contains("第二点"));
     }
 
+    #[test]
+    fn clean_for_tts_removes_narration_and_emoji_but_keeps_explanations() {
+        assert_eq!(clean_for_tts("（微笑）你好 😊", 1000), "你好");
+        assert_eq!(clean_for_tts("我会（轻轻叹气）。", 1000), "我会。");
+        assert_eq!(clean_for_tts("版本（推荐）和函数（x）", 1000), "版本推荐和函数x");
+        assert_eq!(clean_for_tts("[疑惑]你确定吗？", 1000), "你确定吗？");
+        assert_eq!(clean_for_tts("*挑眉*当然可以。", 1000), "当然可以。");
+    }
     #[test]
     fn clean_for_tts_truncates() {
         let text = "abcdefghij";

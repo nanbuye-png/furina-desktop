@@ -1,4 +1,5 @@
 import { audioLevelFromTimeDomain, smoothAudioLevel } from "./audioLevel.js";
+import { SpeechTextFilter, filterSpeechText } from "./speechText.js";
 
 // TTS 预合成管线：合成端边收边合成、播放端顺序播放（句间 280ms 自然停顿）。
 // stop() 递增令牌，使在途合成结果作废，避免旧语音重新入队。
@@ -23,6 +24,7 @@ export class TtsPipeline {
     this.onStatus = onStatus || (() => {});
     this.onSpeaking = onSpeaking || (() => {});
     this.onAudioLevel = onAudioLevel || (() => {});
+    this.speechFilter = new SpeechTextFilter();
     this.ttsQueue = [];
     this.playQueue = [];
     this.playing = false;
@@ -41,9 +43,33 @@ export class TtsPipeline {
     this.lastAudioSampleAt = 0;
   }
 
+  beginResponse() {
+    this.speechFilter.reset();
+  }
+
   speak(text) {
     if (!this.enabled) return;
-    this.ttsQueue.push(text);
+    for (const speechText of this.speechFilter.push(text)) this.enqueue(speechText);
+  }
+
+  finishResponse() {
+    if (!this.enabled) {
+      this.speechFilter.reset();
+      return;
+    }
+    for (const speechText of this.speechFilter.flush()) this.enqueue(speechText);
+  }
+
+  speakImmediate(text) {
+    if (!this.enabled) return;
+    const speechText = filterSpeechText(text);
+    if (speechText) this.enqueue(speechText);
+  }
+
+  enqueue(text) {
+    const speechText = String(text || '').trim();
+    if (!speechText) return;
+    this.ttsQueue.push(speechText);
     this.kickSynth();
     this.kickPlay();
   }
@@ -215,6 +241,7 @@ export class TtsPipeline {
     this.playQueue = [];
     this.playing = false;
     this.synthToken++;
+    this.speechFilter.reset();
     this.onSpeaking(false);
   }
 

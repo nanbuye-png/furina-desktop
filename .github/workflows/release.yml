@@ -58,9 +58,9 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           $installer = Get-ChildItem target/x86_64-pc-windows-msvc/release/bundle/nsis -Filter *.exe | Select-Object -First 1
           if (-not $installer) { throw "未生成 NSIS 安装器" }
-          Copy-Item $installer.FullName dist/Furina-Desktop-0.1.4-x64-Setup.exe
+          Copy-Item $installer.FullName dist/Furina-Desktop-0.1.5-x64-Setup.exe
           ./scripts/build-portable.ps1 -ExecutablePath target/x86_64-pc-windows-msvc/release/furina-desktop.exe
-          Get-FileHash dist/Furina-Desktop-0.1.4-x64-Setup.exe, dist/Furina-Desktop-0.1.4-x64-Portable.zip -Algorithm SHA256 |
+          Get-FileHash dist/Furina-Desktop-0.1.5-x64-Setup.exe, dist/Furina-Desktop-0.1.5-x64-Portable.zip -Algorithm SHA256 |
             ForEach-Object { "{0}  {1}" -f $_.Hash.ToLowerInvariant(), (Split-Path $_.Path -Leaf) } |
             Set-Content -Encoding ascii dist/SHA256SUMS.txt
       - name: Verify release artifacts
@@ -71,10 +71,10 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: Furina Desktop v0.1.4
-          body_path: docs/RELEASE_NOTES_0.1.4.md
+          name: Furina Desktop v0.1.5
+          body_path: docs/RELEASE_NOTES_0.1.5.md
           prerelease: false
           files: |
-            dist/Furina-Desktop-0.1.4-x64-Setup.exe
-            dist/Furina-Desktop-0.1.4-x64-Portable.zip
+            dist/Furina-Desktop-0.1.5-x64-Setup.exe
+            dist/Furina-Desktop-0.1.5-x64-Portable.zip
             dist/SHA256SUMS.txt

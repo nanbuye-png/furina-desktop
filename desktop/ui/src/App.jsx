@@ -165,6 +165,7 @@ export default function App() {
           currentAssistantRef.current = null;
           setThinking(true);
           ttsRef.current?.stop();
+          ttsRef.current?.beginResponse();
           voiceEmotionRef.current.reset();
           setSilentTalkingActive(false);
           avatarRef.current?.listen(false);
@@ -178,6 +179,7 @@ export default function App() {
         case "message":
           if (ev.role === "assistant") {
             for (const s of streamRef.current.flush()) appendAssistant(s);
+            ttsRef.current?.finishResponse();
           }
           break;
         case "scan":
@@ -289,9 +291,10 @@ export default function App() {
           break;
         case "interjection":
           pushMsg({ kind: "interjection", text: ev.text || "" });
-          if (ev.text) ttsRef.current?.speak(ev.text);
+          if (ev.text) ttsRef.current?.speakImmediate(ev.text);
           break;
         case "done":
+          ttsRef.current?.finishResponse();
           setThinking(false);
           avatarRef.current?.think(false);
           setSilentTalkingActive(false);
